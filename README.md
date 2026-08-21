@@ -36,3 +36,21 @@ that was published is recorded in each run's step summary.
 
 Bug reports and questions about `@sift-wiki/q` go in this repository's
 issue tracker.
+
+## Repository posture
+
+This repository is the trust root of the npm lane, so it is locked down harder than the
+workflow it holds:
+
+- `main` accepts changes only through a pull request with one approval from a code owner
+  who is not the author; no bypass actors.
+- The `production` environment requires a reviewer's approval for every run, forbids
+  self-review, and does not let admins bypass; its deployment-branch policy is `main` only,
+  and the read-only source token is released only there.
+- `tests/publish-npm-workflow.test.mjs` pins the workflow's security invariants (two jobs,
+  `id-token` only on the publisher, SHA-pinned actions, exact npm, `single-branch` checkout,
+  `--ignore-scripts` in the publisher, provenance off, kill switch first). `ci.yml` runs it on
+  every pull request; each invariant has been mutation-verified.
+- The lane has a kill switch: the `production` environment variable `NPM_PUBLISHER_LANE`
+  must equal `github-actions-oidc` or the first step refuses. Environment admins can flip it
+  without a workflow edit.

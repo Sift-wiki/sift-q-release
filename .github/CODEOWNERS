@@ -1,0 +1,7 @@
+# Review from a code owner is required (branch ruleset) for every change.
+# The workflow is the trust root of the npm lane; its tests and this file
+# travel with it.
+/.github/workflows/   @Unobtainiumrock @goodnight000
+/tests/               @Unobtainiumrock @goodnight000
+/.github/CODEOWNERS   @Unobtainiumrock @goodnight000
+*                     @Unobtainiumrock @goodnight000
