@@ -178,7 +178,15 @@ test('R1: the publish job re-runs every guard check except the build-job-only fr
   assert.match(publishJob, /verifyGreenCi\(sha, runGh\)/);
   assert.match(publishJob, /verifyGreenReleaseGates\(sha, runGh\);/);
   assert.match(publishJob, /instanceof PublishGuardError/);
-  assert.doesNotMatch(publishJob, /runPublishGuard|verifyFreshBundle/);
+  assert.doesNotMatch(publishJob, /runPublishGuard/);
+  // The check set is a contract with the private repo; the runner script
+  // refuses if the guard exports a verify* check it neither calls nor
+  // deliberately skips, so a check added there cannot be silently dropped here.
+  assert.match(publishJob, /const CALLED = \["verifyExactMain", "verifyGreenCi", "verifyGreenReleaseGates"\];/);
+  assert.match(publishJob, /const SKIPPED = \["verifyFreshBundle"\];/);
+  assert.match(publishJob, /filter\(\(k\) => \/\^verify\[A-Z\]\/\.test\(k\) && !SKIPPED\.includes\(k\)\)/);
+  assert.match(publishJob, /JSON\.stringify\(exported\) !== JSON\.stringify\(expected\)[\s\S]*?process\.exit\(1\)/);
+  assert.doesNotMatch(publishJob, /verifyFreshBundle\(/, 'the freshness check is named as skipped, never called');
   // The runner script goes to RUNNER_TEMP, never into the checkout, so the
   // guard's clean-tree check still passes.
   assert.match(publishJob, /cat >"\$RUNNER_TEMP\/run-guard\.mjs"/);

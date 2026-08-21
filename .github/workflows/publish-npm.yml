@@ -437,8 +437,24 @@ jobs:
           import { execFileSync } from "node:child_process";
           import { resolve } from "node:path";
           import { pathToFileURL } from "node:url";
-          const { PublishGuardError, verifyExactMain, verifyGreenCi, verifyGreenReleaseGates } =
-            await import(pathToFileURL(resolve("prepublish-guard.mjs")));
+          const guard = await import(pathToFileURL(resolve("prepublish-guard.mjs")));
+          const { PublishGuardError, verifyExactMain, verifyGreenCi, verifyGreenReleaseGates } = guard;
+          // Bidirectional tripwire on the check set (shared contract with the
+          // private repo's prepublish-guard.test.mjs). If the guard ever
+          // exports a verify* check this script does not call, refuse: a new
+          // check must be wired here deliberately, never skipped silently.
+          // verifyFreshBundle is the one deliberate exception (see above); it
+          // is module-internal today, and stays excepted if it is ever exported.
+          const CALLED = ["verifyExactMain", "verifyGreenCi", "verifyGreenReleaseGates"];
+          const SKIPPED = ["verifyFreshBundle"];
+          const exported = Object.keys(guard).filter((k) => /^verify[A-Z]/.test(k) && !SKIPPED.includes(k)).sort();
+          const expected = [...CALLED].sort();
+          if (JSON.stringify(exported) !== JSON.stringify(expected)) {
+            console.error("publish refused: prepublish-guard.mjs exports checks " + JSON.stringify(exported) +
+              " but this job calls " + JSON.stringify(CALLED) + " and deliberately skips " + JSON.stringify(SKIPPED) +
+              ". Wire the new check here (or decide, in a reviewed PR, that it belongs to the build job only).");
+            process.exit(1);
+          }
           const runGit = (args) =>
             execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
           const runGh = (args) =>
