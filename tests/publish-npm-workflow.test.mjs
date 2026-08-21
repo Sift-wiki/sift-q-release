@@ -164,7 +164,32 @@ test('R1: no pnpm, no setup-node, no cache, no build in the publish job', () => 
 
 test('R1: the only dependency the publish job installs is the pinned npm itself', () => {
   const installs = [...publishJob.matchAll(/\b(?:npm|pnpm|yarn|corepack) (?:ci|install|add)\b[^\n]*/g)].map((m) => m[0]);
-  assert.deepEqual(installs, ['npm install -g "npm@$NPM_VERSION"']);
+  // The publish job has no setup-node (R1), so the default global prefix is
+  // /usr/local — root-owned on the runner image — and a plain `npm install
+  // -g` EACCESs. Installed into an explicit runner-writable --prefix instead
+  // and prepended to PATH (see the next test), so this is the one dependency
+  // install this job performs.
+  assert.deepEqual(installs, ['npm install -g --prefix "$npm_prefix" "npm@$NPM_VERSION"']);
+});
+
+test('R1: the pinned npm installs into a runner-writable prefix and is put on PATH for the rest of the job', () => {
+  // Not the default global prefix (/usr/local, root-owned with no
+  // setup-node in this job) — an explicit prefix under RUNNER_TEMP.
+  assert.match(publishJob, /npm_prefix="\$RUNNER_TEMP\/npm-pinned"/);
+  assert.match(publishJob, /npm install -g --prefix "\$npm_prefix" "npm@\$NPM_VERSION"/);
+  // Prepended to PATH via GITHUB_PATH so every later `npm` in this job —
+  // including `npm publish` — resolves to this exact pinned binary, not an
+  // absolute path.
+  assert.match(publishJob, /echo "\$npm_prefix\/bin" >> "\$GITHUB_PATH"/);
+  assert.match(publishJob, /test "\$\("\$npm_prefix\/bin\/npm" --version\)" = "\$NPM_VERSION"/);
+  // The only place `$npm_prefix/bin/npm` (an absolute path) may appear is
+  // the version assertion right after install; every later npm invocation
+  // in the job (npm publish, npm view) must be bare so it resolves through
+  // the PATH this step set up via GITHUB_PATH.
+  const prefixedNpmCalls = (publishJob.match(/\$npm_prefix\/bin\/npm\b/g) || []).length;
+  assert.equal(prefixedNpmCalls, 1, 'the pinned prefix path should be used only in the post-install version assertion');
+  assert.match(publishJob, /\n\s+run: npm publish "\$PUBLISH_TARBALL"/, 'npm publish must be a bare invocation, resolved via PATH');
+  assert.match(publishJob, /\n\s+LATEST=\$\(npm view "\$PACKAGE" dist-tags\.latest/, 'npm view must be a bare invocation, resolved via PATH');
 });
 
 test('R1: the only actions in the publish job are SHA-pinned checkout and download-artifact', () => {
