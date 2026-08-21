@@ -311,13 +311,19 @@ jobs:
         # E403 unless its log lines are visible. Grep the output for `oidc`
         # when this step fails.
         #
-        # No --provenance and no NPM_CONFIG_PROVENANCE anywhere: the SOURCE is
-        # private and the tarball's repository.url points at this relay; let
-        # npm decide provenance on its own rather than force a mismatch.
+        # Provenance is switched OFF on purpose. npm auto-generates a
+        # provenance attestation for every OIDC publish of a public package
+        # from a public repository, and all three hold here. That attestation
+        # would name Sift-wiki/sift-q-release@<relay commit> as the build
+        # source, a commit that contains no source code: the SOURCE is the
+        # private sift-q-refactor SHA the step summary records. An attestation
+        # pointing at the wrong repository is worse than none, so the package
+        # ships without provenance until the source is public.
         if: ${{ !inputs.dry_run }}
         working-directory: packages/sift-q
         env:
           GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'false'
         run: npm publish --loglevel verbose
 
       - name: verify the registry now serves the published version as latest

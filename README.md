@@ -25,6 +25,13 @@ runner, and GitHub-hosted runners are free only for public repositories.
 4. Rollback is roll-forward: npm versions are immutable and the OIDC lane
    cannot move dist-tags, so a bad release is followed by a fixed patch.
 
+The package ships **without a provenance attestation**. npm would generate
+one automatically for an OIDC publish from this public repository, but it
+would name a commit of this repository as the build source, and this
+repository contains no source. Rather than publish a misleading attestation,
+the workflow sets `NPM_CONFIG_PROVENANCE=false`; the private source commit
+that was published is recorded in each run's step summary.
+
 ## Issues
 
 Bug reports and questions about `@sift-wiki/q` go in this repository's
