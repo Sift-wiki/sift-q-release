@@ -159,6 +159,18 @@ test("signed candidate verification is required before tarball upload", () => {
   assert.match(selectJob, /compression-level: 0/);
 });
 
+test("dry runs never upload unpublished candidate bytes", () => {
+  const uploadStep = selectJob.slice(
+    selectJob.lastIndexOf("\n      - uses: actions/upload-artifact"),
+    selectJob.indexOf("\n      - name: candidate summary"),
+  );
+  assert.match(uploadStep, /if: \$\{\{ !inputs\.dry_run \}\}/);
+  assert.equal(
+    (selectJob.match(/uses: actions\/upload-artifact/g) ?? []).length,
+    1,
+  );
+});
+
 test("select never installs dependencies, builds, packs, or runs candidate code", () => {
   assert.doesNotMatch(
     selectJob,

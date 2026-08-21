@@ -44,15 +44,20 @@ issue tracker.
 
 ## Repository posture
 
-This repository is the trust root of the npm lane, so it is locked down harder than the
-workflow it holds:
+This repository is the trust root of the npm lane, so it must be locked down harder than
+the workflow it holds:
 
 - `main` accepts changes only through a pull request with one approval from a code owner
   who is not the author; no bypass actors.
-- The `candidate-selection` and `production` environments each require a reviewer's
-  approval, forbid self-review and admin bypass, and allow only `main`. The private read
-  token and candidate trust policy exist only in `candidate-selection`; the npm OIDC job
-  uses only `production`, so it is not authorized to receive either private-source secret.
+- Activation is currently fail-closed: the `candidate-selection` environment does not yet
+  exist, while `production` still contains `SIFT_Q_READ_TOKEN`. Before enabling this
+  workflow, an environment administrator must create `candidate-selection`, require a
+  reviewer, forbid self-review and admin bypass, allow only `main`, and add only
+  `CANDIDATE_SELECTION_LANE=exact-development-candidate`, `SIFT_Q_READ_TOKEN`, and
+  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`. After verifying that boundary live, remove
+  `SIFT_Q_READ_TOKEN` from `production`. `production` must retain its reviewer and
+  main-only protections and only `NPM_PUBLISHER_LANE=github-actions-oidc`; the npm OIDC
+  job must not receive either private-source secret.
 - `tests/publish-npm-workflow.test.mjs` pins the workflow boundary: dispatch-only exact
   identifiers, `id-token` only on the publisher, no source credential in that job,
   SHA-pinned actions, exact npm, exact tarball transfer, provenance off, and kill switch
