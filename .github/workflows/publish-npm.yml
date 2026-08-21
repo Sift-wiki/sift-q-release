@@ -133,27 +133,37 @@ jobs:
 
       # Check the PRIVATE source out into the workspace root so every
       # working-directory below is the same path it would be in that repo.
-      # fetch-depth 1 with `ref: main`: ONLY main is fetched, so the private
-      # repo's other branch names never appear in this public log.
-      # `fetch-depth: 0` is what leaked them — actions/checkout documents it as
-      # "all history for all branches and tags", and it fetches
+      # `ref: main` with the DEFAULT fetch-depth (1): actions/checkout fetches
+      # exactly one ref, so the private repo's other branch names never appear
+      # in this public log. `fetch-depth: 0` is what leaked them — the action
+      # documents it as "all history for all branches and tags" and fetches
       # +refs/heads/*:refs/remotes/origin/*. (`single-branch` is NOT an
-      # actions/checkout input; it was silently ignored and the list still
-      # printed. Verified against the action's own action.yml and a real run.)
-      # Depth 1 is enough: the guard only runs `remote get-url`, `fetch origin
-      # main`, `rev-parse HEAD`, `rev-parse origin/main`, and `status
-      # --porcelain` — no history walk. actions/checkout keeps the token in
-      # http.extraheader (a file under RUNNER_TEMP), NOT in the remote URL, so
-      # `git remote get-url origin` returns the plain URL that the guard's
-      # CANONICAL_ORIGINS allowlist accepts. Credentials stay persisted because
-      # the guard's own fetch must succeed against a private repository.
+      # actions/checkout input: the runner logged "Unexpected input(s)" and
+      # fetched all refs anyway; the `lint-run-logs` job below fails the run
+      # if that warning ever reappears.) The step after the checkout
+      # unshallows main only, explicitly and with --no-tags, so the guard and
+      # any history walk see the full history of that ONE branch.
+      # actions/checkout keeps the token in http.extraheader (a file under
+      # RUNNER_TEMP), NOT in the remote URL, so `git remote get-url origin`
+      # returns the plain URL that the guard's CANONICAL_ORIGINS allowlist
+      # accepts. Credentials stay persisted because the guard's own fetch must
+      # succeed against a private repository.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Sift-wiki/sift-q-refactor
           token: ${{ secrets.SIFT_Q_READ_TOKEN }}
           ref: main
-          fetch-depth: 1
           persist-credentials: true
+
+      - name: unshallow main only (no other branches, no tags)
+        run: |
+          set -euo pipefail
+          git fetch --unshallow --no-tags origin main
+          test "$(git rev-parse --is-shallow-repository)" = "false" || { echo "refusing: still shallow after unshallow"; exit 1; }
+          # The only remote-tracking ref may be origin/main; anything else means
+          # a branch list was fetched and is now in this public log's reach.
+          REFS=$(git for-each-ref --format='%(refname)' refs/remotes/ refs/tags/ | grep -v '^refs/remotes/origin/main$' || true)
+          test -z "$REFS" || { echo "refusing: fetched refs other than origin/main:"; echo "$REFS"; exit 1; }
 
       - name: prove the remote URL the guard will see
         id: source
@@ -341,15 +351,25 @@ jobs:
       # Fresh checkout: the guard's exact-main, clean-tree, and CI/gates checks
       # run again here, right before the write, against live origin/main. If
       # main moved since `build`, the guard (and the SHA check below) refuse.
-      # fetch-depth 1 for the same reason as the build job: depth 0 fetches
-      # every branch and prints their names into this public log.
+      # Default fetch-depth + explicit unshallow of main only, for the same
+      # reason as the build job: depth 0 fetches every branch and prints their
+      # names into this public log.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Sift-wiki/sift-q-refactor
           token: ${{ secrets.SIFT_Q_READ_TOKEN }}
           ref: main
-          fetch-depth: 1
           persist-credentials: true
+
+      - name: unshallow main only (no other branches, no tags)
+        run: |
+          set -euo pipefail
+          git fetch --unshallow --no-tags origin main
+          test "$(git rev-parse --is-shallow-repository)" = "false" || { echo "refusing: still shallow after unshallow"; exit 1; }
+          # The only remote-tracking ref may be origin/main; anything else means
+          # a branch list was fetched and is now in this public log's reach.
+          REFS=$(git for-each-ref --format='%(refname)' refs/remotes/ refs/tags/ | grep -v '^refs/remotes/origin/main$' || true)
+          test -z "$REFS" || { echo "refusing: fetched refs other than origin/main:"; echo "$REFS"; exit 1; }
 
       - name: refuse if main moved since the build job
         env:
@@ -481,3 +501,40 @@ jobs:
           done
           echo "publish did not land as latest within ~60s"
           exit 1
+
+  lint-run-logs:
+    name: fail on "Unexpected input(s)" in any job log
+    # An unknown `with:` key on an action is NOT an error to the runner — it
+    # logs "Unexpected input(s)" and carries on, which is how `single-branch`
+    # silently did nothing while invariant tests certified it. This job reads
+    # the completed jobs' logs of THIS run and fails if that warning appears,
+    # so a no-op input can never again pass as a control. It runs after build
+    # and publish whatever their result (a cancelled run has nothing to lint),
+    # holds no secret and no id-token, and never touches the private source.
+    needs: [build, publish]
+    if: ${{ always() && needs.build.result != 'skipped' && needs.build.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: scan this run's job logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          SELF: ${{ github.job }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+          while IFS=$'\t' read -r ID NAME STATUS; do
+            [ "$STATUS" = "completed" ] || { echo "skip $NAME (status $STATUS)"; continue; }
+            LOG=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$ID/logs") || { echo "cannot read log of $NAME"; FAIL=1; continue; }
+            if printf '%s' "$LOG" | grep -n 'Unexpected input(s)' ; then
+              echo "::error::job '$NAME' logged 'Unexpected input(s)': an action ignored a with: key"
+              FAIL=1
+            else
+              echo "ok: $NAME"
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+                    --jq '.jobs[] | [.id, .name, .status] | @tsv')
+          exit $FAIL

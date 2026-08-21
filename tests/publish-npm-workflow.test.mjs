@@ -14,7 +14,8 @@ const cfg = wf
   .join('\n');
 const jobs = cfg.slice(cfg.indexOf('\njobs:'));
 const buildJob = jobs.slice(jobs.indexOf('\n  build:'), jobs.indexOf('\n  publish:'));
-const publishJob = jobs.slice(jobs.indexOf('\n  publish:'));
+const publishJob = jobs.slice(jobs.indexOf('\n  publish:'), jobs.indexOf('\n  lint-run-logs:'));
+const lintJob = jobs.slice(jobs.indexOf('\n  lint-run-logs:'));
 
 test('dispatch-only trigger; nothing runs on push, PR, or schedule', () => {
   const on = cfg.slice(cfg.indexOf('\non:'), cfg.indexOf('\npermissions:'));
@@ -30,14 +31,18 @@ test('one publish at a time, never cancelled mid-write', () => {
   assert.match(cfg, /\nconcurrency:\n\s+group: npm-publish\n\s+cancel-in-progress: false\n/);
 });
 
-test('two jobs: build has no id-token; publish is the only job with id-token: write', () => {
+test('three jobs: build and lint-run-logs have no id-token; publish is the only job with id-token: write', () => {
+  assert.deepEqual([...jobs.matchAll(/\n  ([a-z-]+):\n/g)].map((m) => m[1]), ['build', 'publish', 'lint-run-logs']);
   assert.doesNotMatch(buildJob, /id-token/);
+  assert.doesNotMatch(lintJob, /id-token|secrets\./);
   assert.match(buildJob, /permissions:\n\s+contents: read\n/);
   assert.match(publishJob, /permissions:\n\s+contents: read\n\s+id-token: write\n/);
   assert.equal((cfg.match(/id-token: write/g) || []).length, 1);
 });
 
-test('both jobs run on GitHub-hosted ubuntu-latest in the production environment', () => {
+test('all jobs run on GitHub-hosted ubuntu-latest; build and publish in the production environment', () => {
+  assert.match(lintJob, /runs-on: ubuntu-latest\n/);
+  assert.doesNotMatch(lintJob, /blacksmith|self-hosted|environment:/);
   for (const job of [buildJob, publishJob]) {
     assert.match(job, /runs-on: ubuntu-latest\n/);
     assert.match(job, /environment: production\n/);
@@ -73,23 +78,49 @@ test('npm is pinned to an exact version and asserted after install', () => {
   assert.doesNotMatch(cfg, /npm@latest|npm@\^/);
 });
 
-test('source checkout: private repo, read token, main only, full history of that one branch', () => {
+test('source checkout: private repo, read token, ref main, default depth, then an explicit unshallow of main only', () => {
   const checkouts = [...cfg.matchAll(/uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n([\s\S]*?)(?=\n      - )/g)];
   assert.equal(checkouts.length, 2);
   for (const [, withBlock] of checkouts) {
     assert.match(withBlock, /repository: Sift-wiki\/sift-q-refactor/);
     assert.match(withBlock, /token: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
     assert.match(withBlock, /ref: main/);
-    // fetch-depth 1, NOT 0: actions/checkout documents 0 as "all history for
-    // all branches and tags" and it fetches +refs/heads/*, which printed the
-    // private repo's entire branch list into this public log. `single-branch`
-    // is not an actions/checkout input at all — it was silently ignored, and
-    // an earlier version of this test pinned it, which gave false assurance.
-    // Depth 1 with `ref: main` fetches only main; the guard needs no history.
-    assert.match(withBlock, /fetch-depth: 1/);
+    // `fetch-depth: 0` is "all history for all branches and tags" and printed
+    // the private repo's branch list into this public log. The default depth
+    // (1) fetches exactly `ref`; history comes from the explicit unshallow
+    // step below, not from a checkout input. `single-branch` is not an
+    // actions/checkout input at all — the runner logged "Unexpected input(s)"
+    // and fetched everything, while an earlier version of this test pinned
+    // it. Only keys actions/checkout@v7 actually accepts may appear here.
     assert.doesNotMatch(withBlock, /fetch-depth: 0/);
     assert.doesNotMatch(withBlock, /single-branch/);
+    const KNOWN = new Set(['allow-unsafe-pr-checkout', 'repository', 'ref', 'token', 'ssh-key', 'ssh-known-hosts', 'ssh-strict', 'ssh-user',
+      'persist-credentials', 'path', 'clean', 'filter', 'sparse-checkout', 'sparse-checkout-cone-mode',
+      'fetch-depth', 'fetch-tags', 'show-progress', 'lfs', 'submodules', 'set-safe-directory', 'github-server-url']);
+    for (const [, key] of withBlock.matchAll(/\n\s{10}([a-z-]+):/g)) {
+      assert.ok(KNOWN.has(key), `'${key}' is not an actions/checkout input; the runner would ignore it`);
+    }
   }
+  // The unshallow step directly follows each checkout, in both jobs.
+  const unshallows = [...cfg.matchAll(/uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n[\s\S]*?\n      - name: unshallow main only[^\n]*\n[\s\S]*?git fetch --unshallow --no-tags origin main\n/g)];
+  assert.equal(unshallows.length, 2);
+  for (const job of [buildJob, publishJob]) {
+    assert.match(job, /git fetch --unshallow --no-tags origin main/);
+    assert.match(job, /rev-parse --is-shallow-repository/);
+    assert.match(job, /grep -v '\^refs\/remotes\/origin\/main\$'/);
+  }
+});
+
+test('lint-run-logs fails the run on "Unexpected input(s)" in any completed job log', () => {
+  assert.match(lintJob, /needs: \[build, publish\]\n/);
+  assert.match(lintJob, /if: \$\{\{ always\(\)/);
+  assert.match(lintJob, /permissions:\n\s+actions: read\n/);
+  assert.doesNotMatch(lintJob, /uses:|SIFT_Q_READ_TOKEN|sift-q-refactor/);
+  assert.match(lintJob, /actions\/runs\/\$RUN_ID\/jobs/);
+  assert.match(lintJob, /actions\/jobs\/\$ID\/logs/);
+  assert.match(lintJob, /grep -n 'Unexpected input\(s\)'/);
+  assert.match(lintJob, /FAIL=1/);
+  assert.match(lintJob, /exit \$FAIL/);
 });
 
 test('no npm credential, no registry-url, no corepack, provenance explicitly off', () => {
