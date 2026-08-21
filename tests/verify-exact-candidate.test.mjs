@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -13,6 +16,7 @@ import test from "node:test";
 import {
   CANDIDATE_ARTIFACT_NAME,
   CANDIDATE_FILES,
+  PACKAGE_REPOSITORY,
   SOURCE_REPOSITORY,
   SOURCE_REPOSITORY_ID,
   SOURCE_WORKFLOW_PATH,
@@ -179,8 +183,10 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
     const sourceRoot = join(root, "source");
     const contractRoot = join(sourceRoot, "scripts", "ol");
     const candidateDirectory = join(root, "candidate");
+    const packageRoot = join(root, "package");
     mkdirSync(contractRoot, { recursive: true });
     mkdirSync(candidateDirectory);
+    mkdirSync(packageRoot);
     writeFileSync(
       join(contractRoot, "candidate-contract.mjs"),
       `
@@ -201,17 +207,51 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
           throw new Error("stub runtime canary differs");
         }
       }
-      export function packageManifestFromTarball() {
-        return {
-          name: "@sift-wiki/q",
-          version: "1.2.3",
-          repository: { type: "git", url: "git+https://github.com/Sift-wiki/sift-q-refactor.git" },
-        };
-      }
       `,
     );
 
-    const tarball = Buffer.from("exact immutable tarball bytes");
+    assert.deepEqual(PACKAGE_REPOSITORY, {
+      type: "git",
+      url: "git+https://github.com/Sift-wiki/sift-q-release.git",
+    });
+    const writePackageManifest = (url) =>
+      writeFileSync(
+        join(packageRoot, "package.json"),
+        JSON.stringify({
+          name: "@sift-wiki/q",
+          version: "1.2.3",
+          repository: { type: "git", url },
+          files: ["README.md"],
+        }),
+      );
+    writePackageManifest("git+https://github.com/Sift-wiki/sift-q-release.git");
+    writeFileSync(join(packageRoot, "README.md"), "real packed fixture\n");
+    const pack = () => {
+      const result = JSON.parse(
+        execFileSync(
+          "npm",
+          [
+            "pack",
+            "--ignore-scripts",
+            "--json",
+            "--pack-destination",
+            candidateDirectory,
+          ],
+          {
+            cwd: packageRoot,
+            encoding: "utf8",
+            env: { ...process.env, npm_config_cache: join(root, "npm-cache") },
+          },
+        ),
+      );
+      assert.equal(result.length, 1);
+      renameSync(
+        join(candidateDirectory, result[0].filename),
+        join(candidateDirectory, "npm-package.tgz"),
+      );
+      return readFileSync(join(candidateDirectory, "npm-package.tgz"));
+    };
+    const tarball = pack();
     const tarballDigest = digest(tarball);
     const receiptDigest = `sha256:${"7".repeat(64)}`;
     const runtimeDigest = `sha256:${"8".repeat(64)}`;
@@ -230,7 +270,6 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
         },
       },
     };
-    writeFileSync(join(candidateDirectory, "npm-package.tgz"), tarball);
     writeFileSync(
       join(candidateDirectory, "signed-development-candidate.json"),
       JSON.stringify(candidate),
@@ -269,10 +308,27 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
     assert.equal(verified.sourceSha, candidateSha);
     assert.equal(verified.version, "1.2.3");
 
-    writeFileSync(
-      join(candidateDirectory, "npm-package.tgz"),
-      "repacked bytes",
+    rmSync(join(candidateDirectory, "npm-package.tgz"));
+    writePackageManifest(
+      "git+https://github.com/Sift-wiki/sift-q-refactor.git",
     );
+    pack();
+    await assert.rejects(
+      verifyCandidate({
+        sourceRoot,
+        candidateDirectory,
+        trustPolicyPath,
+        selection,
+        expectedReceiptDigest: receiptDigest,
+        expectedVersion: "1.2.3",
+      }),
+      /npm tarball repository differs/,
+    );
+
+    rmSync(join(candidateDirectory, "npm-package.tgz"));
+    writePackageManifest("git+https://github.com/Sift-wiki/sift-q-release.git");
+    writeFileSync(join(packageRoot, "README.md"), "repacked fixture bytes\n");
+    pack();
     await assert.rejects(
       verifyCandidate({
         sourceRoot,

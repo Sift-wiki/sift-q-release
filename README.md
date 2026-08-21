@@ -36,6 +36,10 @@ would name a commit of this repository as the build source, and this
 repository contains no source. Rather than publish a misleading attestation,
 the workflow sets `NPM_CONFIG_PROVENANCE=false`; the private source commit
 that was published is recorded in each run's step summary.
+The tarball's `repository` metadata names this public relay, as required by the
+npm trusted-publishing relationship. That is distinct from source identity,
+which remains pinned to `Sift-wiki/sift-q-refactor` by the private run, signed
+candidate receipts, exact commit tree, and trust policy.
 
 ## Issues
 

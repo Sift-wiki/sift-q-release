@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 export const SOURCE_REPOSITORY = "Sift-wiki/sift-q-refactor";
 export const SOURCE_REPOSITORY_ID = 1_329_084_838;
@@ -15,9 +16,9 @@ export const CANDIDATE_FILES = Object.freeze([
 ]);
 
 const PACKAGE_NAME = "@sift-wiki/q";
-const PACKAGE_REPOSITORY = Object.freeze({
+export const PACKAGE_REPOSITORY = Object.freeze({
   type: "git",
-  url: "git+https://github.com/Sift-wiki/sift-q-refactor.git",
+  url: "git+https://github.com/Sift-wiki/sift-q-release.git",
 });
 const DEVELOPMENT_ENVIRONMENT_ID = "sift-q-development";
 const PRODUCTION_ENVIRONMENT_ID = "sift-q-production";
@@ -47,6 +48,82 @@ function exactObject(value, expected, label) {
     JSON.stringify(value) === JSON.stringify(expected),
     `${label} differs`,
   );
+}
+
+function parseTarString(bytes) {
+  const zero = bytes.indexOf(0);
+  return bytes.subarray(0, zero === -1 ? bytes.length : zero).toString("utf8");
+}
+
+function parseTarSize(bytes) {
+  const value = parseTarString(bytes).trim();
+  invariant(/^[0-7]+$/.test(value), "npm tarball has an invalid entry size");
+  const size = Number.parseInt(value, 8);
+  invariant(
+    Number.isSafeInteger(size) && size >= 0,
+    "npm tarball entry is too large",
+  );
+  return size;
+}
+
+function safeTarPath(path) {
+  invariant(
+    path !== "" &&
+      !path.startsWith("/") &&
+      !path.includes("\\") &&
+      !path.split("/").includes(".."),
+    "npm tarball contains an unsafe path",
+  );
+}
+
+export function packageManifestFromTarball(tarball) {
+  let archive;
+  try {
+    archive = gunzipSync(tarball, { maxOutputLength: 64 * 1024 * 1024 });
+  } catch {
+    throw new Error("npm tarball is not a bounded gzip archive");
+  }
+  let offset = 0;
+  const manifests = [];
+  while (offset + 512 <= archive.length) {
+    const header = archive.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const name = parseTarString(header.subarray(0, 100));
+    const prefix = parseTarString(header.subarray(345, 500));
+    const path = prefix === "" ? name : `${prefix}/${name}`;
+    safeTarPath(path);
+    const size = parseTarSize(header.subarray(124, 136));
+    const type = String.fromCharCode(header[156] || 48);
+    invariant(
+      type === "0" || type === "5",
+      "npm tarball contains a non-file entry",
+    );
+    const contentStart = offset + 512;
+    const contentEnd = contentStart + size;
+    invariant(contentEnd <= archive.length, "npm tarball entry is truncated");
+    if (path === "package/package.json") {
+      invariant(type === "0", "npm package manifest is not a regular file");
+      manifests.push(archive.subarray(contentStart, contentEnd));
+    }
+    offset = contentStart + Math.ceil(size / 512) * 512;
+  }
+  invariant(
+    manifests.length === 1,
+    "npm tarball must contain exactly one package/package.json",
+  );
+  let manifest;
+  try {
+    manifest = JSON.parse(manifests[0].toString("utf8"));
+  } catch {
+    throw new Error("npm tarball package manifest is invalid JSON");
+  }
+  invariant(
+    manifest !== null &&
+      typeof manifest === "object" &&
+      !Array.isArray(manifest),
+    "npm tarball package manifest is invalid",
+  );
+  return manifest;
 }
 
 export function validateRunSelection({
@@ -274,7 +351,7 @@ export async function verifyCandidate({
     now,
   });
 
-  const manifest = npmContract.packageManifestFromTarball(tarball);
+  const manifest = packageManifestFromTarball(tarball);
   invariant(manifest.name === PACKAGE_NAME, "npm tarball package name differs");
   invariant(
     STABLE_VERSION.test(manifest.version),
