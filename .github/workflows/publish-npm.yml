@@ -1,0 +1,345 @@
+name: publish-npm
+
+# The ONE publish lane for @sift-wiki/q. Everything else about the package
+# lives in the PRIVATE repository Sift-wiki/sift-q-refactor; this public
+# repository holds only this file and a README.
+#
+# Why a relay repository exists at all.
+#   npm trusted publishing (OIDC) accepts tokens only from GitHub-HOSTED
+#   runners (the OIDC claim runner_environment must be "github-hosted";
+#   Blacksmith and every other third-party pool register as "self-hosted" and
+#   npm rejects them). GitHub-hosted minutes are frozen for this org's PRIVATE
+#   repositories, but they are free and unmetered for PUBLIC ones, and a job on
+#   a public repo in this org has been verified to land on a real
+#   runner_environment=github-hosted runner. So the publish job runs HERE, on a
+#   public repo, and checks the private source out with a read-only token.
+#   The source stays private; nothing of it is committed here.
+#
+# What the SIFT_Q_READ_TOKEN secret is and is not.
+#   A fine-grained PAT scoped to Sift-wiki/sift-q-refactor only, with
+#   Contents:read, Actions:read, Metadata:read. It CAN clone, `git fetch
+#   origin main`, read workflow runs, run attempts and `actions/runs/{id}/jobs`.
+#   It CANNOT write anything, and it CANNOT read `commits/{sha}/check-runs`
+#   (fine-grained PATs have no Checks permission; that call 403s). It is never
+#   an npm credential: npm auth here is the job's OIDC identity, nothing else.
+#
+# Why `environment: production` matters HERE and not in the private repo.
+#   GitHub enforces environment protection rules (the main-only deployment
+#   branch policy) on PUBLIC repositories regardless of plan. On this org's
+#   Free plan the same rule on a private repo is decorative. Here it is real:
+#   a dispatch from any ref other than main never receives SIFT_Q_READ_TOKEN,
+#   so it cannot even check the source out, let alone publish. The npm
+#   trusted-publisher record also names this environment; every field of that
+#   record (owner, repo, workflow filename, environment) must match exactly.
+#
+# What this lane does NOT change: the publish proof. `npm publish` runs the
+# package's `prepublishOnly` lifecycle script (build + prepublish-guard.mjs)
+# UNCHANGED inside this job, immediately before the registry write. The guard
+# still demands: canonical origin URL, HEAD == origin/main after a live fetch,
+# a clean tree (tracked and untracked), a green ci.yml run on main for the
+# SHA with a unique green "all gates passed" check, and a green
+# release-gates.yml workflow_dispatch run for the SHA.
+#
+# What OIDC takes away: dist-tag promotion. "Trusted publishing only applies
+# to the npm publish command" (npm docs): the exchanged token cannot run
+# `npm dist-tag add`, so publish-to-next-then-promote is impossible in this
+# lane. The canary therefore runs BEFORE the publish (pack, install the
+# tarball into a clean prefix, exercise the binary) and the publish goes
+# straight to `latest`. npm versions are immutable, so rollback = roll
+# forward: land a fix on main, bump the version, dispatch again.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run everything except the registry write (checkout, canary, guard).
+        type: boolean
+        default: true
+      expected_version:
+        description: Optional. Refuse unless packages/sift-q/package.json version equals this.
+        type: string
+        default: ''
+
+# Nothing at the workflow level; the one job below grants exactly what it needs.
+permissions: {}
+
+# One publish at a time, and never cancel one in flight: a cancelled run can
+# abandon a registry write that already started.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  PACKAGE: '@sift-wiki/q'
+  SOURCE_REPO: Sift-wiki/sift-q-refactor
+
+jobs:
+  publish:
+    name: publish @sift-wiki/q
+    # MUST be GitHub-hosted: npm OIDC requires runner_environment=github-hosted.
+    # This is the whole reason the job lives in a public repo (free hosted
+    # minutes). Never move it to a self-hosted or third-party label.
+    runs-on: ubuntu-latest
+    # Enforced on this PUBLIC repo: main-only deployment branch policy, and the
+    # SIFT_Q_READ_TOKEN secret is released only to runs on main. The `if:` is
+    # belt-and-braces on top of that enforcement, not a substitute for it.
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    # Job-level, not workflow-level. `contents: read` is for THIS repo's
+    # GITHUB_TOKEN, which nothing here uses (the source checkout authenticates
+    # with SIFT_Q_READ_TOKEN); it is kept because GitHub needs at least one
+    # non-empty permission map to mint GITHUB_TOKEN at all, and read is the
+    # narrowest. `id-token: write` is the npm OIDC exchange; mandatory.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Check the PRIVATE source out into the workspace root so every
+      # working-directory below is the same path it would be in that repo.
+      # fetch-depth 0 so origin/main is a real ref for the guard to compare
+      # against after its own `git fetch origin main`. actions/checkout keeps
+      # the token in http.extraheader (a file under RUNNER_TEMP), NOT in the
+      # remote URL, so `git remote get-url origin` returns the plain
+      # https://github.com/Sift-wiki/sift-q-refactor URL that the guard's
+      # CANONICAL_ORIGINS allowlist accepts. Credentials stay persisted because
+      # the guard's fetch must succeed against a private repository.
+      - uses: actions/checkout@v7
+        with:
+          repository: Sift-wiki/sift-q-refactor
+          token: ${{ secrets.SIFT_Q_READ_TOKEN }}
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: prove the remote URL the guard will see
+        run: |
+          set -euo pipefail
+          ORIGIN=$(git remote get-url origin)
+          echo "origin: $ORIGIN"
+          case "$ORIGIN" in
+            https://github.com/Sift-wiki/sift-q-refactor|https://github.com/Sift-wiki/sift-q-refactor.git) ;;
+            *)
+              echo "refusing: origin is '$ORIGIN', which prepublish-guard.mjs will not accept"
+              exit 1
+              ;;
+          esac
+          echo "HEAD: $(git rev-parse HEAD)"
+          echo "origin/main: $(git rev-parse origin/main)"
+          git fetch origin main --quiet
+          echo "origin/main after live fetch: $(git rev-parse origin/main)"
+
+      # Reads `packageManager` from the checked-out root package.json (the
+      # workspace root IS the checkout, so the default package_json_file is
+      # the right file).
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: package.json
+
+      # Deliberately no `registry-url:`. It writes an .npmrc line that expands
+      # to the literal string ${NODE_AUTH_TOKEN} when no token is set, which
+      # turns a silent OIDC failure into a confusing 401 instead of a clean
+      # refusal. OIDC needs no .npmrc and no NODE_AUTH_TOKEN.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: install an npm that can do OIDC trusted publishing
+        # Node 22 bundles npm 10.9.x and actions/setup-node has no npm-version
+        # input, so an explicit global install is the only way. Trusted
+        # publishing needs npm >= 11.5.1. Pin the 11 line: npm@latest is 12.x,
+        # whose engines require a newer Node than `node-version: 22` promises.
+        # Deliberately no `corepack enable`: the root package.json declares
+        # packageManager: pnpm@..., and a corepack shim would refuse npm. Run
+        # from RUNNER_TEMP so nothing in the checkout can intercept either.
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          npm install -g 'npm@^11.5.1'
+          npm --version
+          node -e '
+            const [major, minor, patch] = process.argv[1].split(".").map(Number);
+            const ok = major === 11 && (minor > 5 || (minor === 5 && patch >= 1));
+            if (!ok) {
+              console.error("refusing: npm " + process.argv[1] + " cannot do OIDC trusted publishing");
+              process.exit(1);
+            }
+          ' "$(npm --version)"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: preflight the version
+        # Three refusals, all before anything is built:
+        #   1. expected_version set and different from package.json -> refuse
+        #      (the dispatcher was looking at a different main than this one).
+        #   2. the version is already on the registry -> refuse (npm versions
+        #      are immutable; a re-run can only ever 403).
+        #   3. the registry is unreadable -> refuse. Fails closed: an
+        #      unreadable registry is not proof of absence.
+        # Ask for the whole version list rather than `npm view pkg@ver`: the
+        # latter exits 1 with E404 for an absent version, indistinguishable
+        # from an outage by exit code alone.
+        working-directory: packages/sift-q
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p 'require("./package.json").version')
+          echo "packages/sift-q/package.json version: $VERSION"
+          if [ -n "${EXPECTED_VERSION:-}" ] && [ "$EXPECTED_VERSION" != "$VERSION" ]; then
+            echo "refusing: expected_version is '$EXPECTED_VERSION' but main has '$VERSION'."
+            echo "Re-check what is on origin/main and dispatch again with the matching version (or no expected_version)."
+            exit 1
+          fi
+          PUBLISHED=$(npm view "$PACKAGE" versions --json) || {
+            echo "refusing: cannot read $PACKAGE from the registry"
+            exit 1
+          }
+          node -e '
+            const [version, body] = process.argv.slice(1);
+            let versions;
+            try { versions = JSON.parse(body); } catch { versions = undefined; }
+            if (typeof versions === "string") versions = [versions];
+            if (!Array.isArray(versions) || versions.length === 0) {
+              console.error("refusing: the registry returned no readable version list");
+              process.exit(1);
+            }
+            if (versions.includes(version)) {
+              console.error(
+                "refusing: " + version + " is already on the registry and npm versions are " +
+                  "immutable. Bump packages/sift-q/package.json, land it on main, and dispatch again.",
+              );
+              process.exit(1);
+            }
+            console.error(version + " is not on the registry yet.");
+          ' "$VERSION" "$PUBLISHED"
+          echo "PUBLISH_VERSION=$VERSION" >>"$GITHUB_ENV"
+
+      - name: pre-publish canary (pack, install from the tarball, run it)
+        # The OIDC lane cannot publish to `next` and promote later, so the
+        # canary runs on the exact tarball BEFORE the registry write:
+        #   pack   -> pnpm pack (its prepack builds dist) into RUNNER_TEMP, never
+        #             into the checkout: a stray .tgz would fail the guard's
+        #             clean-tree check.
+        #   install-> npm install of that .tgz into an empty prefix under a
+        #             throwaway HOME, so no workspace link or cache can hide a
+        #             packaging error.
+        #   run    -> `sift-q --version` must print exactly "sift-q <ver>", and
+        #             `sift-q install --dry-run --yes --client codex` must exit
+        #             0 (plans without writing; CI=1 so no terminal prompts).
+        # Both temp dirs are removed afterwards.
+        run: |
+          set -euo pipefail
+          PACK_DIR="$RUNNER_TEMP/pack"
+          CANARY_PREFIX="$RUNNER_TEMP/canary"
+          CANARY_HOME="$RUNNER_TEMP/canary-home"
+          mkdir -p "$PACK_DIR" "$CANARY_PREFIX" "$CANARY_HOME"
+
+          (cd packages/sift-q && pnpm pack --pack-destination "$PACK_DIR")
+          TARBALL="$PACK_DIR/sift-wiki-q-$PUBLISH_VERSION.tgz"
+          if [ ! -f "$TARBALL" ]; then
+            echo "refusing: expected $TARBALL, found:"; ls -la "$PACK_DIR"; exit 1
+          fi
+          tar -tzf "$TARBALL"
+
+          # Clean consumer: empty prefix, throwaway HOME, no workspace in sight.
+          (
+            cd "$CANARY_PREFIX"
+            HOME="$CANARY_HOME" npm install --prefix "$CANARY_PREFIX" --no-audit --no-fund "$TARBALL"
+          )
+          BIN="$CANARY_PREFIX/node_modules/.bin/sift-q"
+
+          OUT=$(HOME="$CANARY_HOME" "$BIN" --version)
+          echo "sift-q --version -> $OUT"
+          if [ "$OUT" != "sift-q $PUBLISH_VERSION" ]; then
+            echo "refusing: expected 'sift-q $PUBLISH_VERSION'"; exit 1
+          fi
+
+          RUN_HOME=$(mktemp -d)
+          RUN_CWD=$(mktemp -d)
+          (cd "$RUN_CWD" && HOME="$RUN_HOME" CI=1 "$BIN" install --dry-run --yes --client codex)
+          echo "canary passed for $PACKAGE@$PUBLISH_VERSION"
+
+          rm -rf "$PACK_DIR" "$CANARY_PREFIX" "$CANARY_HOME" "$RUN_HOME" "$RUN_CWD"
+          # The canary must not have dirtied the checkout.
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "refusing: the canary left the checkout dirty:"; git status --porcelain --untracked-files=all; exit 1
+          fi
+
+      - name: dry run — prove the guard passes here, then stop
+        # On the real publish the guard runs inside `prepublishOnly`; a dry run
+        # has no `npm publish`, so run the identical script explicitly with
+        # the identical environment (GH_TOKEN = the read-only PAT, the token
+        # the guard's `gh api` calls will use for real). A green step here
+        # means a dispatch with dry_run=false on this SHA differs only by the
+        # registry write.
+        if: ${{ inputs.dry_run }}
+        working-directory: packages/sift-q
+        env:
+          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          node build.mjs
+          node prepublish-guard.mjs
+          git status --porcelain --untracked-files=all
+          {
+            echo "## dry run: $PACKAGE@$PUBLISH_VERSION would publish"
+            echo
+            echo "- source: $SOURCE_REPO @ $(git rev-parse HEAD) (origin/main)"
+            echo "- canary: passed (tarball installed clean, --version and install --dry-run OK)"
+            echo "- guard: prepublish-guard.mjs passed with the read-only token"
+            echo "- registry write: SKIPPED (dry_run=true)"
+            echo
+            echo "Dispatch again with dry_run=false to publish this exact SHA to latest."
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "dry run complete; not publishing."
+
+      - name: publish with OIDC trusted publishing
+        # `npm publish` (NOT pnpm publish: pnpm 11 regressed OIDC) from the
+        # package directory, so the `prepublishOnly` lifecycle script runs the
+        # build and then the unchanged prepublish-guard.mjs as the last thing
+        # before the registry write. GH_TOKEN is what the guard's `gh api`
+        # calls authenticate with (the read-only PAT); it is never an npm
+        # credential.
+        #
+        # No NODE_AUTH_TOKEN, no .npmrc credential, no --otp: npm exchanges
+        # this job's OIDC identity for a short-lived publish token.
+        #
+        # --loglevel verbose is deliberate. npm's oidc() helper never throws,
+        # so a failed token exchange surfaces only as a downstream ENEEDAUTH /
+        # E403 unless its log lines are visible. Grep the output for `oidc`
+        # when this step fails.
+        #
+        # No --provenance and no NPM_CONFIG_PROVENANCE anywhere: the SOURCE is
+        # private and the tarball's repository.url points at this relay; let
+        # npm decide provenance on its own rather than force a mismatch.
+        if: ${{ !inputs.dry_run }}
+        working-directory: packages/sift-q
+        env:
+          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+        run: npm publish --loglevel verbose
+
+      - name: verify the registry now serves the published version as latest
+        # Registry propagation is not instant; poll for about a minute.
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            LATEST=$(npm view "$PACKAGE" dist-tags.latest 2>/dev/null || true)
+            if [ "$LATEST" = "$PUBLISH_VERSION" ]; then
+              echo "$PACKAGE@$PUBLISH_VERSION is latest."
+              {
+                echo "## published $PACKAGE@$PUBLISH_VERSION to latest"
+                echo
+                echo "- source: $SOURCE_REPO @ $(git rev-parse HEAD)"
+                echo "- https://www.npmjs.com/package/@sift-wiki/q/v/$PUBLISH_VERSION"
+                echo "- rollback = roll forward: land a fix on main, bump the version, dispatch again."
+              } >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt $attempt: dist-tags.latest is '${LATEST:-<unreadable>}', expected '$PUBLISH_VERSION'; waiting 10s"
+            sleep 10
+          done
+          echo "publish did not land as latest within ~60s: dist-tags.latest is '${LATEST:-<unreadable>}', expected '$PUBLISH_VERSION'"
+          exit 1
