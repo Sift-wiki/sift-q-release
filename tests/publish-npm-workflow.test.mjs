@@ -1,205 +1,228 @@
-// Invariants of .github/workflows/publish-npm.yml. The workflow is the trust
-// root of the npm lane; a change that breaks one of these is either a bug or a
-// security regression, and must be made deliberately, here, in the same PR.
-// Zero dependencies: `node --test 'tests/**/*.test.mjs'` runs it in relay CI.
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
 
-const wf = readFileSync(new URL('../.github/workflows/publish-npm.yml', import.meta.url), 'utf8');
-// Comments are documentation, not configuration; test the configuration.
+const wf = readFileSync(
+  new URL("../.github/workflows/publish-npm.yml", import.meta.url),
+  "utf8",
+);
 const cfg = wf
-  .split('\n')
-  .filter((l) => !/^\s*#/.test(l))
-  .join('\n');
-const jobs = cfg.slice(cfg.indexOf('\njobs:'));
-const buildJob = jobs.slice(jobs.indexOf('\n  build:'), jobs.indexOf('\n  publish:'));
-const publishJob = jobs.slice(jobs.indexOf('\n  publish:'), jobs.indexOf('\n  lint-run-logs:'));
-const lintJob = jobs.slice(jobs.indexOf('\n  lint-run-logs:'));
+  .split("\n")
+  .filter((line) => !/^\s*#/.test(line))
+  .join("\n");
+const jobs = cfg.slice(cfg.indexOf("\njobs:"));
+const selectJob = jobs.slice(
+  jobs.indexOf("\n  select:"),
+  jobs.indexOf("\n  publish:"),
+);
+const publishJob = jobs.slice(
+  jobs.indexOf("\n  publish:"),
+  jobs.indexOf("\n  lint-run-logs:"),
+);
+const lintJob = jobs.slice(jobs.indexOf("\n  lint-run-logs:"));
 
-test('dispatch-only trigger; nothing runs on push, PR, or schedule', () => {
-  const on = cfg.slice(cfg.indexOf('\non:'), cfg.indexOf('\npermissions:'));
+test("dispatch-only trigger requires exact candidate run and receipt identity", () => {
+  const on = cfg.slice(cfg.indexOf("\non:"), cfg.indexOf("\npermissions:"));
   assert.match(on, /workflow_dispatch:/);
-  assert.doesNotMatch(on, /\n\s{2}(push|pull_request|schedule|workflow_run|repository_dispatch):/);
+  assert.doesNotMatch(
+    on,
+    /\n\s{2}(push|pull_request|schedule|workflow_run|repository_dispatch):/,
+  );
+  assert.match(on, /candidate_run_id:[\s\S]*?required: true/);
+  assert.match(on, /candidate_receipt_digest:[\s\S]*?required: true/);
 });
 
-test('workflow-level permissions are empty', () => {
+test("workflow permissions are empty and concurrency never cancels a possible write", () => {
   assert.match(cfg, /\npermissions: \{\}\n/);
+  assert.match(cfg, /group: npm-publish\n\s+cancel-in-progress: false/);
 });
 
-test('one publish at a time, never cancelled mid-write', () => {
-  assert.match(cfg, /\nconcurrency:\n\s+group: npm-publish\n\s+cancel-in-progress: false\n/);
-});
-
-test('three jobs: build and lint-run-logs have no id-token; publish is the only job with id-token: write', () => {
-  assert.deepEqual([...jobs.matchAll(/\n  ([a-z-]+):\n/g)].map((m) => m[1]), ['build', 'publish', 'lint-run-logs']);
-  assert.doesNotMatch(buildJob, /id-token/);
+test("select and lint cannot mint OIDC; publish is the only id-token job", () => {
+  assert.deepEqual(
+    [...jobs.matchAll(/\n  ([a-z-]+):\n/g)].map((match) => match[1]),
+    ["select", "publish", "lint-run-logs"],
+  );
+  assert.doesNotMatch(selectJob, /id-token/);
   assert.doesNotMatch(lintJob, /id-token|secrets\./);
-  assert.match(buildJob, /permissions:\n\s+contents: read\n/);
-  assert.match(publishJob, /permissions:\n\s+contents: read\n\s+id-token: write\n/);
-  assert.equal((cfg.match(/id-token: write/g) || []).length, 1);
+  assert.match(
+    publishJob,
+    /permissions:\n\s+contents: read\n\s+id-token: write/,
+  );
+  assert.equal((cfg.match(/id-token: write/g) ?? []).length, 1);
 });
 
-test('all jobs run on GitHub-hosted ubuntu-latest; build and publish in the production environment', () => {
-  assert.match(lintJob, /runs-on: ubuntu-latest\n/);
-  assert.doesNotMatch(lintJob, /blacksmith|self-hosted|environment:/);
-  for (const job of [buildJob, publishJob]) {
-    assert.match(job, /runs-on: ubuntu-latest\n/);
-    assert.match(job, /environment: production\n/);
+test("all jobs are GitHub-hosted; selection and publishing use separate protected environments", () => {
+  for (const job of [selectJob, publishJob, lintJob]) {
+    assert.match(job, /runs-on: ubuntu-latest/);
     assert.doesNotMatch(job, /blacksmith|self-hosted/);
   }
+  assert.match(selectJob, /environment: candidate-selection/);
+  assert.match(publishJob, /environment: production/);
+  assert.doesNotMatch(lintJob, /environment:/);
+  assert.match(selectJob, /if: github\.ref == 'refs\/heads\/main'/);
+  assert.match(publishJob, /needs: select/);
+  assert.match(publishJob, /if: \$\{\{ !inputs\.dry_run \}\}/);
 });
 
-test('build refuses off main, and publish needs build and is skipped on dry runs', () => {
-  assert.match(buildJob, /if: github\.ref == 'refs\/heads\/main'\n/);
-  assert.match(publishJob, /needs: build\n/);
-  assert.match(publishJob, /if: \$\{\{ !inputs\.dry_run \}\}\n/);
+test("the environment kill switch is the first select step", () => {
+  const firstStep = selectJob
+    .slice(selectJob.indexOf("    steps:"))
+    .split("\n      - ")[1];
+  assert.match(
+    firstStep,
+    /CANDIDATE_SELECTION_LANE: \$\{\{ vars\.CANDIDATE_SELECTION_LANE \}\}/,
+  );
+  assert.match(firstStep, /!= "exact-development-candidate"/);
+  assert.doesNotMatch(firstStep, /actions\/checkout|SIFT_Q_READ_TOKEN/);
 });
 
-test('the lane kill switch is the first build step and checks the exact value', () => {
-  const firstStep = buildJob.slice(buildJob.indexOf('    steps:')).split('\n      - ')[1];
-  assert.match(firstStep, /NPM_PUBLISHER_LANE: \$\{\{ vars\.NPM_PUBLISHER_LANE \}\}/);
-  assert.match(firstStep, /!= "github-actions-oidc" \]; then[\s\S]*exit 1/);
-  assert.ok(firstStep.indexOf('actions/checkout') === -1, 'kill switch runs before checkout');
+test("the OIDC job has a separate production kill switch and no selection authority", () => {
+  const firstStep = publishJob
+    .slice(publishJob.indexOf("    steps:"))
+    .split("\n      - ")[1];
+  assert.match(
+    firstStep,
+    /NPM_PUBLISHER_LANE: \$\{\{ vars\.NPM_PUBLISHER_LANE \}\}/,
+  );
+  assert.match(firstStep, /!= "github-actions-oidc"/);
+  assert.doesNotMatch(
+    publishJob,
+    /candidate-selection|CANDIDATE_SELECTION_LANE|SIFT_Q_READ_TOKEN|DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON/,
+  );
 });
 
-test('every action is pinned to a 40-hex commit SHA', () => {
+test("every action is pinned to a 40-hex commit SHA", () => {
   const uses = [...cfg.matchAll(/uses: ([^\s@]+)@(\S+)/g)];
-  assert.ok(uses.length >= 6, `expected several uses:, got ${uses.length}`);
+  assert.ok(
+    uses.length >= 4,
+    `expected at least four uses:, got ${uses.length}`,
+  );
   for (const [, action, ref] of uses) {
-    assert.match(ref, /^[0-9a-f]{40}$/, `${action} is pinned to '${ref}', not a commit SHA`);
+    assert.match(ref, /^[0-9a-f]{40}$/, `${action} is not commit-SHA pinned`);
   }
 });
 
-test('npm is pinned to an exact version and asserted after install', () => {
-  assert.match(cfg, /NPM_VERSION: 11\.\d+\.\d+\n/);
-  assert.match(cfg, /npm install -g "npm@\$NPM_VERSION"/);
-  assert.match(cfg, /test "\$\(npm --version\)" = "\$NPM_VERSION"/);
-  assert.doesNotMatch(cfg, /npm@latest|npm@\^/);
-});
-
-test('source checkout: private repo, read token, ref main, default depth, then an explicit unshallow of main only', () => {
-  const checkouts = [...cfg.matchAll(/uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n([\s\S]*?)(?=\n      - )/g)];
-  assert.equal(checkouts.length, 2);
-  for (const [, withBlock] of checkouts) {
-    assert.match(withBlock, /repository: Sift-wiki\/sift-q-refactor/);
-    assert.match(withBlock, /token: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
-    assert.match(withBlock, /ref: main/);
-    // `fetch-depth: 0` is "all history for all branches and tags" and printed
-    // the private repo's branch list into this public log. The default depth
-    // (1) fetches exactly `ref`; history comes from the explicit unshallow
-    // step below, not from a checkout input. `single-branch` is not an
-    // actions/checkout input at all — the runner logged "Unexpected input(s)"
-    // and fetched everything, while an earlier version of this test pinned
-    // it. Only keys actions/checkout@v7 actually accepts may appear here.
-    assert.doesNotMatch(withBlock, /fetch-depth: 0/);
-    assert.doesNotMatch(withBlock, /single-branch/);
-    const KNOWN = new Set(['allow-unsafe-pr-checkout', 'repository', 'ref', 'token', 'ssh-key', 'ssh-known-hosts', 'ssh-strict', 'ssh-user',
-      'persist-credentials', 'path', 'clean', 'filter', 'sparse-checkout', 'sparse-checkout-cone-mode',
-      'fetch-depth', 'fetch-tags', 'show-progress', 'lfs', 'submodules', 'set-safe-directory', 'github-server-url']);
-    for (const [, key] of withBlock.matchAll(/\n\s{10}([a-z-]+):/g)) {
-      assert.ok(KNOWN.has(key), `'${key}' is not an actions/checkout input; the runner would ignore it`);
-    }
-  }
-  // The unshallow step directly follows each checkout, in both jobs.
-  const unshallows = [...cfg.matchAll(/uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n[\s\S]*?\n      - name: unshallow main only[^\n]*\n[\s\S]*?git fetch --unshallow --no-tags origin main\n/g)];
-  assert.equal(unshallows.length, 2);
-  for (const job of [buildJob, publishJob]) {
-    assert.match(job, /git fetch --unshallow --no-tags origin main/);
-    assert.match(job, /rev-parse --is-shallow-repository/);
-    assert.match(job, /grep -v '\^refs\/remotes\/origin\/main\$'/);
+test("select and publish pin Node 22 with the same SHA-pinned setup action", () => {
+  for (const job of [selectJob, publishJob]) {
+    assert.match(job, /uses: actions\/setup-node@[0-9a-f]{40}/);
+    assert.match(job, /node-version: 22/);
+    assert.doesNotMatch(job, /node-version: (?:latest|current|\*)/);
   }
 });
 
-test('lint-run-logs fails the run on "Unexpected input(s)" in any completed job log', () => {
-  assert.match(lintJob, /needs: \[build, publish\]\n/);
-  assert.match(lintJob, /if: \$\{\{ always\(\)/);
-  assert.match(lintJob, /permissions:\n\s+actions: read\n/);
-  assert.doesNotMatch(lintJob, /uses:|SIFT_Q_READ_TOKEN|sift-q-refactor/);
+test("repo-only credential exists only in select and persisted checkout credentials are disabled", () => {
+  assert.match(selectJob, /GH_TOKEN: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
+  assert.match(selectJob, /token: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
+  assert.equal((selectJob.match(/SIFT_Q_READ_TOKEN/g) ?? []).length, 2);
+  assert.doesNotMatch(
+    publishJob,
+    /SIFT_Q_READ_TOKEN|sift-q-refactor|actions\/checkout/,
+  );
+  assert.doesNotMatch(lintJob, /SIFT_Q_READ_TOKEN|sift-q-refactor/);
+  assert.equal(
+    (selectJob.match(/persist-credentials: false/g) ?? []).length,
+    2,
+  );
+});
+
+test("candidate selection pins private run, repository, workflow, lineage, artifact ID and exact file set", () => {
+  assert.match(selectJob, /actions\/runs\/\$CANDIDATE_RUN_ID/);
+  assert.match(selectJob, /commits\/\$CANDIDATE_SHA/);
+  assert.match(selectJob, /git\/ref\/heads\/main/);
+  assert.match(selectJob, /compare\/\$CANDIDATE_SHA\.\.\.main/);
+  assert.match(selectJob, /verify-exact-candidate\.mjs select-run/);
+  assert.match(selectJob, /actions\/artifacts\/\$ARTIFACT_ID\/zip/);
+  assert.match(selectJob, /unzip -Z1/);
+  for (const name of [
+    "npm-package.tgz",
+    "signed-development-candidate.json",
+    "signed-npm-runtime-canary.json",
+  ]) {
+    assert.match(selectJob, new RegExp(name.replace(".", "\\.")));
+  }
+});
+
+test("signed candidate verification is required before tarball upload", () => {
+  assert.match(selectJob, /DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON/);
+  assert.match(selectJob, /verify-exact-candidate\.mjs verify-candidate/);
+  assert.match(selectJob, /--receipt-digest "\$CANDIDATE_RECEIPT_DIGEST"/);
+  assert.match(selectJob, /--expected-version "\$EXPECTED_VERSION"/);
+  const verifyAt = selectJob.indexOf(
+    "verify-exact-candidate.mjs verify-candidate",
+  );
+  const uploadAt = selectJob.indexOf("uses: actions/upload-artifact");
+  assert.ok(
+    verifyAt > 0 && uploadAt > verifyAt,
+    "verification precedes relay upload",
+  );
+  assert.match(selectJob, /name: exact-candidate-tarball/);
+  assert.match(selectJob, /compression-level: 0/);
+});
+
+test("select never installs dependencies, builds, packs, or runs candidate code", () => {
+  assert.doesNotMatch(
+    selectJob,
+    /pnpm (?:install|build|pack)|npm (?:install|ci)\b|build\.mjs|prepack|node_modules\/\.bin/,
+  );
+  assert.doesNotMatch(selectJob, /action-setup/);
+});
+
+test("publish receives only one digest-pinned tarball and publishes those exact bytes", () => {
+  const uses = [...publishJob.matchAll(/uses: (\S+)/g)].map(
+    (match) => match[1],
+  );
+  assert.deepEqual(
+    uses.map((value) => value.split("@")[0]),
+    ["actions/setup-node", "actions/download-artifact"],
+  );
+  assert.match(publishJob, /name: exact-candidate-tarball/);
+  assert.match(publishJob, /test "\$ACTUAL" = "\$EXPECTED_SHA256"/);
+  assert.match(
+    publishJob,
+    /find "\$RUNNER_TEMP\/verified-artifact"[\s\S]*?-eq 1/,
+  );
+  assert.match(
+    publishJob,
+    /npm publish "\$PUBLISH_TARBALL" --ignore-scripts --access public --loglevel verbose/,
+  );
+});
+
+test("publish installs only exact npm with scripts disabled and carries no long-lived npm token", () => {
+  assert.match(cfg, /NPM_VERSION: 11\.19\.0/);
+  assert.match(
+    publishJob,
+    /npm install -g --ignore-scripts --no-audit --no-fund "npm@\$NPM_VERSION"/,
+  );
+  assert.match(publishJob, /test "\$\(npm --version\)" = "\$NPM_VERSION"/);
+  assert.doesNotMatch(
+    publishJob,
+    /pnpm|yarn|NODE_AUTH_TOKEN|NPM_TOKEN|_authToken|registry-url/,
+  );
+  assert.match(publishJob, /NPM_CONFIG_PROVENANCE: ["']false["']/);
+});
+
+test("registry absence is checked before upload and immediately before publish", () => {
+  assert.match(selectJob, /npm view "\$PACKAGE" versions --json/);
+  assert.match(
+    publishJob,
+    /PUBLISHED=\$\(npm view "\$PACKAGE" versions --json\) \|\|/,
+  );
+  assert.match(
+    publishJob,
+    /if \(!Array\.isArray\(versions\) \|\| versions\.length === 0\) process\.exit\(2\)/,
+  );
+  const preflightAt = publishJob.indexOf('npm view "$PACKAGE" versions --json');
+  const publishAt = publishJob.indexOf('npm publish "$PUBLISH_TARBALL"');
+  assert.ok(preflightAt > 0 && publishAt > preflightAt);
+});
+
+test("lint job scans completed job logs and fails closed on ignored action inputs", () => {
+  assert.match(lintJob, /needs: \[select, publish\]/);
+  assert.match(lintJob, /permissions:\n\s+actions: read/);
   assert.match(lintJob, /actions\/runs\/\$RUN_ID\/jobs/);
-  assert.match(lintJob, /curl -sSfL -H "Authorization: Bearer \$GH_TOKEN"[^\n]*\n[^\n]*actions\/jobs\/\$ID\/logs/);
-  assert.match(lintJob, /\[ "\$CONCLUSION" = "skipped" \]/);
-  assert.match(lintJob, /test -n "\$LOG" \|\|[^\n]*FAIL=1/);
+  assert.match(lintJob, /actions\/jobs\/\$ID\/logs/);
   assert.match(lintJob, /NEEDLE='Unexpected input''\(s\)'/);
   assert.match(lintJob, /grep -nF "\$NEEDLE"/);
-  assert.doesNotMatch(lintJob, /Unexpected input\(s\)/, 'the literal never appears in the job (its name is in every log header; its script is echoed)');
-  assert.match(lintJob, /FAIL=1/);
-  assert.match(lintJob, /cannot list this run's jobs"; exit 1/);
-  assert.match(lintJob, /test -n "\$JOBS" \|\|[^\n]*exit 1/);
-  assert.match(lintJob, /test "\$SCANNED" -ge 1 \|\|[^\n]*exit 1/);
-  assert.match(lintJob, /exit \$FAIL/);
-});
-
-test('no npm credential, no registry-url, no corepack, provenance explicitly off', () => {
-  assert.doesNotMatch(cfg, /NODE_AUTH_TOKEN|NPM_TOKEN|_authToken|registry-url|corepack/);
-  assert.match(publishJob, /NPM_CONFIG_PROVENANCE: 'false'/);
-  assert.doesNotMatch(cfg, /--provenance(?!=false)/);
-});
-
-test('publish job publishes the sha256-verified tarball with --ignore-scripts', () => {
-  assert.match(publishJob, /test "\$ACTUAL" = "\$EXPECTED_SHA256"/);
-  assert.match(publishJob, /npm publish "\$PUBLISH_TARBALL" --ignore-scripts --access public --loglevel verbose/);
-  assert.match(buildJob, /tarball_sha256=\$SHA256/);
-});
-
-test('the full guard runs in the build job; the publish job re-runs it last before the write', () => {
-  assert.match(buildJob, /node build\.mjs\n\s+node prepublish-guard\.mjs/);
-  const guardAt = publishJob.indexOf('node "$RUNNER_TEMP/run-guard.mjs"');
-  const publishAt = publishJob.indexOf('npm publish "$PUBLISH_TARBALL"');
-  assert.ok(guardAt > 0 && publishAt > guardAt, 'guard precedes the publish');
-  const between = publishJob.slice(guardAt, publishAt);
-  assert.equal((between.match(/\n      - name:/g) || []).length, 1, 'exactly one step (the publish) follows the guard');
-});
-
-// R1 (security re-verify 2026-08-20): zero third-party code executes in the
-// job that holds id-token: write. The publish job may run only the runner
-// image's own toolchain, the exact pinned npm, and the guard from the fresh
-// private checkout, against the sha256-pinned tarball the build job proved.
-test('R1: no pnpm, no setup-node, no cache, no build in the publish job', () => {
-  assert.doesNotMatch(publishJob, /pnpm/);
-  assert.doesNotMatch(publishJob, /action-setup|setup-node/);
-  assert.doesNotMatch(publishJob, /\bcache(?:-dependency-path)?:/);
-  assert.doesNotMatch(publishJob, /build\.mjs/);
-});
-
-test('R1: the only dependency the publish job installs is the pinned npm itself', () => {
-  const installs = [...publishJob.matchAll(/\b(?:npm|pnpm|yarn|corepack) (?:ci|install|add)\b[^\n]*/g)].map((m) => m[0]);
-  assert.deepEqual(installs, ['npm install -g "npm@$NPM_VERSION"']);
-});
-
-test('R1: the only actions in the publish job are SHA-pinned checkout and download-artifact', () => {
-  const uses = [...publishJob.matchAll(/uses: (\S+)/g)].map((m) => m[1]);
-  assert.deepEqual(
-    uses.map((u) => u.split('@')[0]),
-    ['actions/checkout', 'actions/download-artifact'],
-  );
-  for (const u of uses) {
-    assert.match(u.split('@')[1] ?? '', /^[0-9a-f]{40}$/, `${u} is not SHA-pinned`);
-  }
-});
-
-test('R1: the publish job re-runs every guard check except the build-job-only freshness check', () => {
-  // Pin the CALL SITES, not just the imported names: a runner script that
-  // imports a check but never invokes it must fail here.
-  assert.match(publishJob, /const sha = verifyExactMain\(runGit\);/);
-  assert.match(publishJob, /verifyGreenCi\(sha, runGh\)/);
-  assert.match(publishJob, /verifyGreenReleaseGates\(sha, runGh\);/);
-  assert.match(publishJob, /instanceof PublishGuardError/);
-  assert.doesNotMatch(publishJob, /runPublishGuard/);
-  // The check set is a contract with the private repo; the runner script
-  // refuses if the guard exports a verify* check it neither calls nor
-  // deliberately skips, so a check added there cannot be silently dropped here.
-  assert.match(publishJob, /const CALLED = \["verifyExactMain", "verifyGreenCi", "verifyGreenReleaseGates"\];/);
-  assert.match(publishJob, /const SKIPPED = \["verifyFreshBundle"\];/);
-  assert.match(publishJob, /filter\(\(k\) => \/\^verify\[A-Z\]\/\.test\(k\) && !SKIPPED\.includes\(k\)\)/);
-  assert.match(publishJob, /JSON\.stringify\(exported\) !== JSON\.stringify\(expected\)[\s\S]*?process\.exit\(1\)/);
-  assert.doesNotMatch(publishJob, /verifyFreshBundle\(/, 'the freshness check is named as skipped, never called');
-  // The runner script goes to RUNNER_TEMP, never into the checkout, so the
-  // guard's clean-tree check still passes.
-  assert.match(publishJob, /cat >"\$RUNNER_TEMP\/run-guard\.mjs"/);
-});
-
-test('publish refuses if main moved since build', () => {
-  assert.match(publishJob, /BUILD_SHA: \$\{\{ needs\.build\.outputs\.source_sha \}\}/);
-  assert.match(publishJob, /test "\$HEAD" = "\$BUILD_SHA" && test "\$MAIN" = "\$BUILD_SHA"/);
+  assert.match(lintJob, /test "\$SCANNED" -ge 1/);
+  assert.match(lintJob, /exit "\$FAIL"/);
 });

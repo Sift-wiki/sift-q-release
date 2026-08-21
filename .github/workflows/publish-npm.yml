@@ -1,534 +1,331 @@
 name: publish-npm
 
-# The ONE publish lane for @sift-wiki/q. Everything else about the package
-# lives in the PRIVATE repository Sift-wiki/sift-q-refactor; this public
-# repository holds this file, its invariant tests, and a README.
+# Public, GitHub-hosted OIDC relay for @sift-wiki/q. The private development
+# workflow builds, deploys and canaries one immutable candidate. This relay
+# consumes that exact candidate by run ID; it never rebuilds the package.
 #
-# Why a relay repository exists at all.
-#   npm trusted publishing (OIDC) accepts tokens only from GitHub-HOSTED
-#   runners (the OIDC claim runner_environment must be "github-hosted";
-#   Blacksmith and every other third-party pool register as "self-hosted" and
-#   npm rejects them — verified by decoding a token minted on Blacksmith).
-#   GitHub-hosted minutes are frozen for this org's PRIVATE repositories, but
-#   they are free and unmetered for PUBLIC ones. So the publish job runs HERE
-#   and checks the private source out with a read-only token. The source
-#   stays private; nothing of it is committed here.
+# Trust split:
+#   select  — no id-token. A repo-scoped read-only token fetches one successful
+#             deploy-development run and its one 3-file artifact. The relay's
+#             verifier checks run/repository/workflow/main lineage, both signed
+#             receipts, source/tree/receipt/tarball digests and package metadata.
+#   publish — no private-repository token or checkout. It receives only the
+#             verified tarball, rechecks its digest and registry absence, and is
+#             the sole job allowed to request an npm OIDC token.
 #
-# Two jobs, on purpose (security review 2026-08-20).
-#   build   — checks the source out, installs dependencies, packs, runs the
-#             canary and the guard. It has NO id-token permission, so nothing
-#             that runs here (dependency lifecycle scripts included) can mint
-#             an OIDC token.
-#   publish — downloads the exact tarball `build` proved, re-runs the guard's
-#             exact-main / clean-tree / green-CI / green-gates checks against a
-#             fresh checkout, and publishes those bytes. It is the only job
-#             with id-token: write, and (R1, security re-verify 2026-08-20) it
-#             runs ZERO third-party code: no pnpm, no setup-node, no dependency
-#             install, no build — only the runner image's toolchain, npm
-#             itself, and the guard from the private checkout.
-#   The tarball crosses the job boundary sha256-pinned: what the canary ran is
-#   what the registry receives.
+# Required candidate-selection environment configuration:
+#   variable CANDIDATE_SELECTION_LANE=exact-development-candidate
+#   secret   SIFT_Q_READ_TOKEN (fine-grained, private source repo only:
+#            Contents:read, Actions:read, Metadata:read)
+#   secret   DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON
+# Required production environment configuration:
+#   variable NPM_PUBLISHER_LANE=github-actions-oidc
 #
-# What the SIFT_Q_READ_TOKEN secret is and is not.
-#   A fine-grained PAT scoped to Sift-wiki/sift-q-refactor only, with
-#   Contents:read, Actions:read, Metadata:read. It CAN clone, `git fetch
-#   origin main`, read workflow runs, run attempts and `actions/runs/{id}/jobs`.
-#   It CANNOT write anything, and it CANNOT read `commits/{sha}/check-runs`
-#   (fine-grained PATs have no Checks permission; that call 403s, and the
-#   guard falls back to the run's job list). It is never an npm credential:
-#   npm auth here is the job's OIDC identity, nothing else.
-#
-# Why `environment: production` matters HERE and not in the private repo.
-#   GitHub enforces environment protection rules on PUBLIC repositories
-#   regardless of plan: the main-only deployment branch policy, the required
-#   reviewer, and can_admins_bypass=false are all real here. A dispatch from
-#   any ref other than main never receives SIFT_Q_READ_TOKEN. The npm
-#   trusted-publisher record also names this environment; every field of that
-#   record (owner, repo, workflow filename, environment) must match exactly.
-#
-# What this lane does NOT change: the publish proof. The build job runs
-# prepublish-guard.mjs UNCHANGED and IN FULL. The publish job re-runs, through
-# the guard's own exported functions, every check that gates the write:
-# canonical origin URL, HEAD == origin/main after a live fetch, a clean tree, a
-# green ci.yml run on main for the SHA with a unique green "all gates passed"
-# fan-in, and a green release-gates.yml workflow_dispatch run for the SHA. The
-# one check the publish job does not repeat is verifyFreshBundle (dist newer
-# than src), because satisfying it would require running the build — and its
-# node_modules — beside id-token: write; the build job already ran it against
-# the exact tarball being published (see the guard step below for the full
-# argument).
-#
-# What OIDC takes away: dist-tag promotion. "Trusted publishing only applies
-# to the npm publish command" (npm docs): the exchanged token cannot run
-# `npm dist-tag add`, so publish-to-next-then-promote is impossible in this
-# lane. The canary therefore runs BEFORE the publish and the publish goes
-# straight to `latest`. npm versions are immutable, so rollback = roll
-# forward: land a fix on main, bump the version, dispatch again.
-#
-# Every action below is pinned to a commit SHA (the tag is a comment). npm is
-# pinned to an exact version. tests/publish-npm-workflow.test.mjs pins these
-# invariants; relay CI runs it on every pull request.
+# Every action is commit-SHA pinned. npm is exact-pinned. The production
+# environment must remain main-only and reviewer protected.
 on:
   workflow_dispatch:
     inputs:
+      candidate_run_id:
+        description: Successful deploy-development workflow run ID to consume.
+        type: string
+        required: true
+      candidate_receipt_digest:
+        description: Exact sha256:... digest of signed-development-candidate.json.
+        type: string
+        required: true
       dry_run:
-        description: Run everything except the registry write (checkout, canary, guard).
+        description: Verify the exact candidate and registry preflight without publishing.
         type: boolean
         default: true
       expected_version:
-        description: Optional. Refuse unless packages/sift-q/package.json version equals this.
+        description: Optional stable x.y.z version expected in the signed tarball.
         type: string
-        default: ''
+        default: ""
 
-# Nothing at the workflow level; each job below grants exactly what it needs.
 permissions: {}
 
-# One publish at a time, and never cancel one in flight: a cancelled run can
-# abandon a registry write that already started.
 concurrency:
   group: npm-publish
   cancel-in-progress: false
 
 env:
-  PACKAGE: '@sift-wiki/q'
+  PACKAGE: "@sift-wiki/q"
   SOURCE_REPO: Sift-wiki/sift-q-refactor
-  # Exact npm: trusted publishing needs >= 11.5.1; npm@latest is the 12 line
-  # whose engines exclude most of Node 22. Bump deliberately, with the test.
   NPM_VERSION: 11.19.0
 
 jobs:
-  build:
-    name: build, canary, and guard @sift-wiki/q
-    # MUST be GitHub-hosted for the lane to work at all (see header); keeping
-    # build on the same runner class keeps the two jobs' toolchains identical.
+  select:
+    name: verify the exact development candidate
     runs-on: ubuntu-latest
-    environment: production
+    environment: candidate-selection
     if: github.ref == 'refs/heads/main'
-    timeout-minutes: 30
-    # No id-token here: this job runs third-party code (pnpm install's
-    # lifecycle scripts, the build) and must not be able to mint an OIDC token.
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
-      version: ${{ steps.preflight.outputs.version }}
-      tarball_sha256: ${{ steps.canary.outputs.tarball_sha256 }}
-      source_sha: ${{ steps.source.outputs.sha }}
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
+      tarball_sha256: ${{ steps.candidate.outputs.tarball_sha256 }}
+      version: ${{ steps.candidate.outputs.version }}
     steps:
-      # Kill switch and decision record (security review finding 4). The
-      # variable lives on the `production` environment, so only environment
-      # admins can flip it, and flipping it needs no workflow edit (which
-      # would need a reviewed pull request). Unset or any other value stops
-      # the lane before it touches the source.
       - name: refuse unless the lane is switched on
+        env:
+          CANDIDATE_SELECTION_LANE: ${{ vars.CANDIDATE_SELECTION_LANE }}
+        run: |
+          set -euo pipefail
+          if [ "${CANDIDATE_SELECTION_LANE:-}" != "exact-development-candidate" ]; then
+            echo "refusing: candidate-selection CANDIDATE_SELECTION_LANE is not exact-development-candidate"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: relay
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: verify the private run and fetch its one exact artifact
+        id: run
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$CANDIDATE_RUN_ID" in
+            ''|*[!0-9]*|0*) echo "refusing: candidate_run_id is invalid"; exit 1 ;;
+          esac
+          BOUNDARY="$RUNNER_TEMP/candidate-boundary"
+          mkdir -p "$BOUNDARY" "$RUNNER_TEMP/development-candidate"
+          gh api "repos/$SOURCE_REPO/actions/runs/$CANDIDATE_RUN_ID" >"$BOUNDARY/run.json"
+          CANDIDATE_SHA=$(node -e '
+            const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            if (!/^[0-9a-f]{40}$/.test(value.head_sha ?? "")) process.exit(1);
+            process.stdout.write(value.head_sha);
+          ' "$BOUNDARY/run.json")
+          gh api "repos/$SOURCE_REPO/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" >"$BOUNDARY/artifacts.json"
+          gh api "repos/$SOURCE_REPO/commits/$CANDIDATE_SHA" >"$BOUNDARY/candidate-commit.json"
+          gh api "repos/$SOURCE_REPO/git/ref/heads/main" >"$BOUNDARY/current-main.json"
+          gh api "repos/$SOURCE_REPO/compare/$CANDIDATE_SHA...main" >"$BOUNDARY/comparison.json"
+          node relay/scripts/verify-exact-candidate.mjs select-run \
+            --run "$BOUNDARY/run.json" \
+            --artifacts "$BOUNDARY/artifacts.json" \
+            --candidate-commit "$BOUNDARY/candidate-commit.json" \
+            --current-main "$BOUNDARY/current-main.json" \
+            --comparison "$BOUNDARY/comparison.json" \
+            --run-id "$CANDIDATE_RUN_ID" \
+            --output "$BOUNDARY/selection.json"
+          ARTIFACT_ID=$(node -p 'require(process.argv[1]).artifactId' "$BOUNDARY/selection.json")
+          gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID/zip" >"$BOUNDARY/candidate.zip"
+          EXPECTED=$(printf '%s\n' npm-package.tgz signed-development-candidate.json signed-npm-runtime-canary.json | sort)
+          ACTUAL=$(unzip -Z1 "$BOUNDARY/candidate.zip" | sort)
+          test "$ACTUAL" = "$EXPECTED" || {
+            echo "refusing: candidate zip does not contain exactly the expected three top-level files"
+            printf 'expected:\n%s\nactual:\n%s\n' "$EXPECTED" "$ACTUAL"
+            exit 1
+          }
+          unzip -q "$BOUNDARY/candidate.zip" -d "$RUNNER_TEMP/development-candidate"
+          echo "candidate_sha=$CANDIDATE_SHA" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Sift-wiki/sift-q-refactor
+          token: ${{ secrets.SIFT_Q_READ_TOKEN }}
+          ref: main
+          path: source
+          persist-credentials: false
+
+      - name: verify signatures, receipts, source identity, and exact tarball bytes
+        id: candidate
+        env:
+          CANDIDATE_RECEIPT_DIGEST: ${{ inputs.candidate_receipt_digest }}
+          CANDIDATE_TRUST_POLICY_JSON: ${{ secrets.DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${CANDIDATE_TRUST_POLICY_JSON:-}" || {
+            echo "refusing: DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON is missing"
+            exit 1
+          }
+          BOUNDARY="$RUNNER_TEMP/candidate-boundary"
+          CURRENT_MAIN=$(node -p 'require(process.argv[1]).currentMainSha' "$BOUNDARY/selection.json")
+          test "$(git -C source rev-parse HEAD)" = "$CURRENT_MAIN" || {
+            echo "refusing: verifier checkout is not the current private main"
+            exit 1
+          }
+          printf '%s' "$CANDIDATE_TRUST_POLICY_JSON" >"$BOUNDARY/trust-policy.json"
+          node relay/scripts/verify-exact-candidate.mjs verify-candidate \
+            --source-root source \
+            --candidate-directory "$RUNNER_TEMP/development-candidate" \
+            --trust-policy "$BOUNDARY/trust-policy.json" \
+            --selection "$BOUNDARY/selection.json" \
+            --receipt-digest "$CANDIDATE_RECEIPT_DIGEST" \
+            --expected-version "$EXPECTED_VERSION" \
+            --output "$BOUNDARY/verified.json"
+          VERSION=$(node -p 'require(process.argv[1]).version' "$BOUNDARY/verified.json")
+          SOURCE_SHA=$(node -p 'require(process.argv[1]).sourceSha' "$BOUNDARY/verified.json")
+          TARBALL_SHA256=$(node -p 'require(process.argv[1]).tarballSha256' "$BOUNDARY/verified.json")
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >>"$GITHUB_OUTPUT"
+          echo "tarball_sha256=$TARBALL_SHA256" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/verified-artifact"
+          cp "$RUNNER_TEMP/development-candidate/npm-package.tgz" \
+            "$RUNNER_TEMP/verified-artifact/sift-wiki-q-$VERSION.tgz"
+
+      - name: refuse an already-published or unreadable registry version
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          set -euo pipefail
+          PUBLISHED=$(npm view "$PACKAGE" versions --json) || {
+            echo "refusing: cannot read $PACKAGE versions from npm"
+            exit 1
+          }
+          node -e '
+            const [version, body] = process.argv.slice(1);
+            let versions;
+            try { versions = JSON.parse(body); } catch { process.exit(2); }
+            if (typeof versions === "string") versions = [versions];
+            if (!Array.isArray(versions) || versions.length === 0) process.exit(2);
+            if (versions.includes(version) && process.env.DRY_RUN !== "true") process.exit(3);
+          ' "$VERSION" "$PUBLISHED" || {
+            STATUS=$?
+            test "$STATUS" = 3 && echo "refusing: $PACKAGE@$VERSION already exists"
+            test "$STATUS" = 2 && echo "refusing: npm returned an unreadable version list"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: exact-candidate-tarball
+          path: ${{ runner.temp }}/verified-artifact/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: candidate summary
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          TARBALL_SHA256: ${{ steps.candidate.outputs.tarball_sha256 }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          {
+            echo "## exact candidate verified"
+            echo
+            echo "- source: $SOURCE_REPO @ $SOURCE_SHA"
+            echo "- package: $PACKAGE@$VERSION"
+            echo "- tarball sha256: $TARBALL_SHA256"
+            echo "- registry write: $([ "$DRY_RUN" = true ] && echo SKIPPED || echo pending)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: publish the verified exact bytes with OIDC
+    needs: select
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: refuse unless the npm OIDC lane is switched on
         env:
           NPM_PUBLISHER_LANE: ${{ vars.NPM_PUBLISHER_LANE }}
         run: |
           set -euo pipefail
           if [ "${NPM_PUBLISHER_LANE:-}" != "github-actions-oidc" ]; then
-            echo "refusing: production environment variable NPM_PUBLISHER_LANE is '${NPM_PUBLISHER_LANE:-}', not 'github-actions-oidc'."
-            echo "The lane is switched off. An environment admin sets the variable to switch it on."
+            echo "refusing: production NPM_PUBLISHER_LANE is not github-actions-oidc"
             exit 1
           fi
-          echo "NPM_PUBLISHER_LANE=github-actions-oidc: the lane is on."
 
-      # Check the PRIVATE source out into the workspace root so every
-      # working-directory below is the same path it would be in that repo.
-      # `ref: main` with the DEFAULT fetch-depth (1): actions/checkout fetches
-      # exactly one ref, so the private repo's other branch names never appear
-      # in this public log. `fetch-depth: 0` is what leaked them — the action
-      # documents it as "all history for all branches and tags" and fetches
-      # +refs/heads/*:refs/remotes/origin/*. (`single-branch` is NOT an
-      # actions/checkout input: the runner logged "Unexpected input(s)" and
-      # fetched all refs anyway; the `lint-run-logs` job below fails the run
-      # if that warning ever reappears.) The step after the checkout
-      # unshallows main only, explicitly and with --no-tags, so the guard and
-      # any history walk see the full history of that ONE branch.
-      # actions/checkout keeps the token in http.extraheader (a file under
-      # RUNNER_TEMP), NOT in the remote URL, so `git remote get-url origin`
-      # returns the plain URL that the guard's CANONICAL_ORIGINS allowlist
-      # accepts. Credentials stay persisted because the guard's own fetch must
-      # succeed against a private repository.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Sift-wiki/sift-q-refactor
-          token: ${{ secrets.SIFT_Q_READ_TOKEN }}
-          ref: main
-          persist-credentials: true
-
-      - name: unshallow main only (no other branches, no tags)
-        run: |
-          set -euo pipefail
-          git fetch --unshallow --no-tags origin main
-          test "$(git rev-parse --is-shallow-repository)" = "false" || { echo "refusing: still shallow after unshallow"; exit 1; }
-          # The only remote-tracking ref may be origin/main; anything else means
-          # a branch list was fetched and is now in this public log's reach.
-          REFS=$(git for-each-ref --format='%(refname)' refs/remotes/ refs/tags/ | grep -v '^refs/remotes/origin/main$' || true)
-          test -z "$REFS" || { echo "refusing: fetched refs other than origin/main:"; echo "$REFS"; exit 1; }
-
-      - name: prove the remote URL the guard will see
-        id: source
-        run: |
-          set -euo pipefail
-          ORIGIN=$(git remote get-url origin)
-          echo "origin: $ORIGIN"
-          case "$ORIGIN" in
-            https://github.com/Sift-wiki/sift-q-refactor|https://github.com/Sift-wiki/sift-q-refactor.git) ;;
-            *)
-              echo "refusing: origin is '$ORIGIN', which prepublish-guard.mjs will not accept"
-              exit 1
-              ;;
-          esac
-          git fetch origin main --quiet
-          echo "HEAD:        $(git rev-parse HEAD)"
-          echo "origin/main: $(git rev-parse origin/main)"
-          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
-
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-        with:
-          package_json_file: package.json
-
-      # Deliberately no `registry-url:`. It writes an .npmrc line that expands
-      # to the literal string ${NODE_AUTH_TOKEN} when no token is set, which
-      # turns a silent OIDC failure into a confusing 401 instead of a clean
-      # refusal. OIDC needs no .npmrc and no NODE_AUTH_TOKEN.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
 
-      - name: install the exact npm
-        # Node 22 bundles npm 10.9.x and actions/setup-node has no npm-version
-        # input. Deliberately no `corepack enable`: the root package.json
-        # declares packageManager: pnpm@..., and a corepack shim would refuse
-        # npm. Run from RUNNER_TEMP so nothing in the checkout can intercept.
+      - name: install the exact npm OIDC client
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          npm install -g "npm@$NPM_VERSION"
-          test "$(npm --version)" = "$NPM_VERSION" || { echo "refusing: npm $(npm --version) != $NPM_VERSION"; exit 1; }
-
-      - run: pnpm install --frozen-lockfile
-
-      - name: preflight the version
-        id: preflight
-        # Refusals before anything is built:
-        #   1. expected_version set and different from package.json -> refuse.
-        #   2. the version is already on the registry -> refuse on a real
-        #      publish (npm versions are immutable); a dry run notes it and
-        #      continues, because a dry run writes nothing and exercising the
-        #      canary and guard is its whole point.
-        #   3. the registry is unreadable -> refuse; not proof of absence.
-        working-directory: packages/sift-q
-        env:
-          EXPECTED_VERSION: ${{ inputs.expected_version }}
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          VERSION=$(node -p 'require("./package.json").version')
-          echo "packages/sift-q/package.json version: $VERSION"
-          if [ -n "${EXPECTED_VERSION:-}" ] && [ "$EXPECTED_VERSION" != "$VERSION" ]; then
-            echo "refusing: expected_version is '$EXPECTED_VERSION' but main has '$VERSION'."
-            exit 1
-          fi
-          PUBLISHED=$(npm view "$PACKAGE" versions --json) || {
-            echo "refusing: cannot read $PACKAGE from the registry"
-            exit 1
-          }
-          node -e '
-            (() => {
-              const [version, body] = process.argv.slice(1);
-              let versions;
-              try { versions = JSON.parse(body); } catch { versions = undefined; }
-              if (typeof versions === "string") versions = [versions];
-              if (!Array.isArray(versions) || versions.length === 0) {
-                console.error("refusing: the registry returned no readable version list");
-                process.exit(1);
-              }
-              if (versions.includes(version)) {
-                if (process.env.DRY_RUN === "true") {
-                  console.error("note: " + version + " is already on the registry; continuing because this is a dry run.");
-                  return;
-                }
-                console.error("refusing: " + version + " is already on the registry and npm versions are immutable. Bump packages/sift-q/package.json, land it on main, and dispatch again.");
-                process.exit(1);
-              }
-              console.error(version + " is not on the registry yet.");
-            })();
-          ' "$VERSION" "$PUBLISHED"
-          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
-
-      - name: pack and run the pre-publish canary
-        id: canary
-        # pnpm pack (its prepack builds dist) into RUNNER_TEMP — never into the
-        # checkout, where a stray .tgz would fail the guard's clean-tree check.
-        # Then install that exact tarball into an empty prefix under a
-        # throwaway HOME and run the binary. The sha256 recorded here is what
-        # the publish job must see again before it writes anything.
-        env:
-          VERSION: ${{ steps.preflight.outputs.version }}
-        run: |
-          set -euo pipefail
-          PACK_DIR="$RUNNER_TEMP/pack"; CANARY_PREFIX="$RUNNER_TEMP/canary"; CANARY_HOME="$RUNNER_TEMP/canary-home"
-          mkdir -p "$PACK_DIR" "$CANARY_PREFIX" "$CANARY_HOME"
-          (cd packages/sift-q && pnpm pack --pack-destination "$PACK_DIR")
-          TARBALL="$PACK_DIR/sift-wiki-q-$VERSION.tgz"
-          test -f "$TARBALL" || { echo "refusing: expected $TARBALL"; ls -la "$PACK_DIR"; exit 1; }
-          tar -tzf "$TARBALL"
-          ( cd "$CANARY_PREFIX" && HOME="$CANARY_HOME" npm install --prefix "$CANARY_PREFIX" --no-audit --no-fund --ignore-scripts "$TARBALL" )
-          BIN="$CANARY_PREFIX/node_modules/.bin/sift-q"
-          OUT=$(HOME="$CANARY_HOME" "$BIN" --version)
-          echo "sift-q --version -> $OUT"
-          test "$OUT" = "sift-q $VERSION" || { echo "refusing: expected 'sift-q $VERSION'"; exit 1; }
-          RUN_HOME=$(mktemp -d); RUN_CWD=$(mktemp -d)
-          (cd "$RUN_CWD" && HOME="$RUN_HOME" CI=1 "$BIN" install --dry-run --yes --client codex)
-          echo "canary passed for $PACKAGE@$VERSION"
-          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
-          echo "tarball sha256: $SHA256"
-          echo "tarball_sha256=$SHA256" >>"$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/artifact" && cp "$TARBALL" "$RUNNER_TEMP/artifact/"
-          rm -rf "$CANARY_PREFIX" "$CANARY_HOME" "$RUN_HOME" "$RUN_CWD"
-          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-            echo "refusing: the canary left the checkout dirty:"; git status --porcelain --untracked-files=all; exit 1
-          fi
-
-      - name: prepublish guard (build job)
-        # The same guard the publish job re-runs. Running it here too means a
-        # dry run proves the guard passes in this environment with the
-        # read-only token, and a real run never uploads a tarball the guard
-        # would refuse.
-        working-directory: packages/sift-q
-        env:
-          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
-        run: |
-          set -euo pipefail
-          node build.mjs
-          node prepublish-guard.mjs
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: tarball
-          path: ${{ runner.temp }}/artifact/*.tgz
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: dry run summary
-        if: ${{ inputs.dry_run }}
-        env:
-          VERSION: ${{ steps.preflight.outputs.version }}
-          SHA: ${{ steps.source.outputs.sha }}
-          TARBALL_SHA256: ${{ steps.canary.outputs.tarball_sha256 }}
-        run: |
-          {
-            echo "## dry run: $PACKAGE@$VERSION would publish"
-            echo
-            echo "- source: $SOURCE_REPO @ $SHA (origin/main)"
-            echo "- tarball sha256: $TARBALL_SHA256"
-            echo "- canary: passed; guard: passed with the read-only token"
-            echo "- registry write: SKIPPED (dry_run=true)"
-            echo
-            echo "Dispatch again with dry_run=false to publish this exact SHA to latest."
-          } >>"$GITHUB_STEP_SUMMARY"
-
-  publish:
-    name: publish the proved tarball with OIDC
-    needs: build
-    if: ${{ !inputs.dry_run }}
-    runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 20
-    # The ONLY job with id-token: write. R1: zero third-party code runs beside
-    # the OIDC token. No pnpm, no setup-node, no dependency install, no build;
-    # the only `uses:` are actions/checkout and actions/download-artifact, and
-    # the only code executed is the runner image's toolchain (node, git, gh),
-    # the exact pinned npm, and prepublish-guard.mjs from the fresh private
-    # checkout. This job publishes a tarball it did not build — the bytes are
-    # sha256-pinned to what the build job packed, canaried, and guarded.
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      # Fresh checkout: the guard's exact-main, clean-tree, and CI/gates checks
-      # run again here, right before the write, against live origin/main. If
-      # main moved since `build`, the guard (and the SHA check below) refuse.
-      # Default fetch-depth + explicit unshallow of main only, for the same
-      # reason as the build job: depth 0 fetches every branch and prints their
-      # names into this public log.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Sift-wiki/sift-q-refactor
-          token: ${{ secrets.SIFT_Q_READ_TOKEN }}
-          ref: main
-          persist-credentials: true
-
-      - name: unshallow main only (no other branches, no tags)
-        run: |
-          set -euo pipefail
-          git fetch --unshallow --no-tags origin main
-          test "$(git rev-parse --is-shallow-repository)" = "false" || { echo "refusing: still shallow after unshallow"; exit 1; }
-          # The only remote-tracking ref may be origin/main; anything else means
-          # a branch list was fetched and is now in this public log's reach.
-          REFS=$(git for-each-ref --format='%(refname)' refs/remotes/ refs/tags/ | grep -v '^refs/remotes/origin/main$' || true)
-          test -z "$REFS" || { echo "refusing: fetched refs other than origin/main:"; echo "$REFS"; exit 1; }
-
-      - name: refuse if main moved since the build job
-        env:
-          BUILD_SHA: ${{ needs.build.outputs.source_sha }}
-        run: |
-          set -euo pipefail
-          git fetch origin main --quiet
-          HEAD=$(git rev-parse HEAD); MAIN=$(git rev-parse origin/main)
-          echo "build job proved: $BUILD_SHA"; echo "this checkout:    $HEAD"; echo "origin/main now:  $MAIN"
-          test "$HEAD" = "$BUILD_SHA" && test "$MAIN" = "$BUILD_SHA" || { echo "refusing: main moved since the build job proved $BUILD_SHA; dispatch again."; exit 1; }
-
-      - name: install the exact npm
-        # No setup-node in this job (R1): the runner image's system Node runs
-        # everything here, and the guard needs only node: builtins plus git and
-        # gh, all part of the image. npm >= 11.5.1 is required for OIDC trusted
-        # publishing, so install the exact pinned npm and assert it. Run from
-        # RUNNER_TEMP so nothing in the checkout can intercept.
-        working-directory: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          echo "system node: $(node --version)"
-          npm install -g "npm@$NPM_VERSION"
-          test "$(npm --version)" = "$NPM_VERSION" || { echo "refusing: npm $(npm --version) != $NPM_VERSION"; exit 1; }
+          npm install -g --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: tarball
-          path: ${{ runner.temp }}/artifact
+          name: exact-candidate-tarball
+          path: ${{ runner.temp }}/verified-artifact
 
-      - name: verify the tarball is the one the canary ran
+      - name: reverify the selected bytes and registry absence
         env:
-          VERSION: ${{ needs.build.outputs.version }}
-          EXPECTED_SHA256: ${{ needs.build.outputs.tarball_sha256 }}
+          EXPECTED_SHA256: ${{ needs.select.outputs.tarball_sha256 }}
+          VERSION: ${{ needs.select.outputs.version }}
         run: |
           set -euo pipefail
-          TARBALL="$RUNNER_TEMP/artifact/sift-wiki-q-$VERSION.tgz"
-          test -f "$TARBALL" || { echo "refusing: $TARBALL missing"; ls -la "$RUNNER_TEMP/artifact"; exit 1; }
+          TARBALL="$RUNNER_TEMP/verified-artifact/sift-wiki-q-$VERSION.tgz"
+          test -f "$TARBALL" && test ! -L "$TARBALL" || { echo "refusing: exact tarball missing"; exit 1; }
+          test "$(find "$RUNNER_TEMP/verified-artifact" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 1 || {
+            echo "refusing: verified artifact contains unexpected files"
+            exit 1
+          }
           ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
-          echo "expected $EXPECTED_SHA256"; echo "actual   $ACTUAL"
-          test "$ACTUAL" = "$EXPECTED_SHA256" || { echo "refusing: tarball changed between build and publish"; exit 1; }
+          test "$ACTUAL" = "$EXPECTED_SHA256" || { echo "refusing: tarball changed after selection"; exit 1; }
+          PUBLISHED=$(npm view "$PACKAGE" versions --json) || {
+            echo "refusing: cannot read $PACKAGE versions from npm"
+            exit 1
+          }
+          node -e '
+            const [version, body] = process.argv.slice(1);
+            let versions;
+            try { versions = JSON.parse(body); } catch { process.exit(2); }
+            if (typeof versions === "string") versions = [versions];
+            if (!Array.isArray(versions) || versions.length === 0) process.exit(2);
+            if (versions.includes(version)) process.exit(3);
+          ' "$VERSION" "$PUBLISHED" || {
+            STATUS=$?
+            test "$STATUS" = 3 && echo "refusing: $PACKAGE@$VERSION already exists"
+            test "$STATUS" = 2 && echo "refusing: npm returned an unreadable version list"
+            exit 1
+          }
           echo "PUBLISH_TARBALL=$TARBALL" >>"$GITHUB_ENV"
 
-      - name: prepublish guard (publish job, last before the write)
-        # Every guard check that gates the write re-runs here, through the
-        # guard's own exported functions: verifyExactMain (canonical origin,
-        # live fetch, HEAD == origin/main, clean tree), verifyGreenCi (green
-        # ci.yml with its unique "all gates passed" fan-in), and
-        # verifyGreenReleaseGates (green release-gates.yml dispatch). The ONE
-        # check deliberately not repeated is verifyFreshBundle (dist/main.js
-        # newer than src/): it exists to stop a stale local build being packed,
-        # and this job builds and packs nothing — the published bytes are the
-        # sha256-pinned tarball from `build`, which ran `node build.mjs &&
-        # node prepublish-guard.mjs`, the FULL guard, freshness included,
-        # against those exact bytes. Satisfying the freshness check here would
-        # require running build.mjs and an installed node_modules beside
-        # id-token: write, which is precisely what R1 removes. The runner
-        # script is written to RUNNER_TEMP, never into the checkout, so the
-        # guard's own clean-tree check still sees a pristine tree.
-        working-directory: packages/sift-q
+      - name: publish the exact candidate with OIDC trusted publishing
         env:
-          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
-        run: |
-          set -euo pipefail
-          cat >"$RUNNER_TEMP/run-guard.mjs" <<'GUARD'
-          import { execFileSync } from "node:child_process";
-          import { resolve } from "node:path";
-          import { pathToFileURL } from "node:url";
-          const guard = await import(pathToFileURL(resolve("prepublish-guard.mjs")));
-          const { PublishGuardError, verifyExactMain, verifyGreenCi, verifyGreenReleaseGates } = guard;
-          // Bidirectional tripwire on the check set (shared contract with the
-          // private repo's prepublish-guard.test.mjs). If the guard ever
-          // exports a verify* check this script does not call, refuse: a new
-          // check must be wired here deliberately, never skipped silently.
-          // verifyFreshBundle is the one deliberate exception (see above); it
-          // is module-internal today, and stays excepted if it is ever exported.
-          const CALLED = ["verifyExactMain", "verifyGreenCi", "verifyGreenReleaseGates"];
-          const SKIPPED = ["verifyFreshBundle"];
-          const exported = Object.keys(guard).filter((k) => /^verify[A-Z]/.test(k) && !SKIPPED.includes(k)).sort();
-          const expected = [...CALLED].sort();
-          if (JSON.stringify(exported) !== JSON.stringify(expected)) {
-            console.error("publish refused: prepublish-guard.mjs exports checks " + JSON.stringify(exported) +
-              " but this job calls " + JSON.stringify(CALLED) + " and deliberately skips " + JSON.stringify(SKIPPED) +
-              ". Wire the new check here (or decide, in a reviewed PR, that it belongs to the build job only).");
-            process.exit(1);
-          }
-          const runGit = (args) =>
-            execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-          const runGh = (args) =>
-            execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-          try {
-            const sha = verifyExactMain(runGit);
-            const fanIn = verifyGreenCi(sha, runGh);
-            verifyGreenReleaseGates(sha, runGh);
-            console.error(
-              "publish guard (publish job): HEAD " + sha + " is exact current main with a clean " +
-              "tree; ci.yml and release-gates.yml are green (fan-in via " + fanIn + "). " +
-              "The freshness check ran in the build job against the exact tarball being published. OK.",
-            );
-          } catch (error) {
-            if (!(error instanceof PublishGuardError)) throw error;
-            console.error("\npublish refused: " + error.message + "\n");
-            process.exit(1);
-          }
-          GUARD
-          node "$RUNNER_TEMP/run-guard.mjs"
-
-      - name: publish with OIDC trusted publishing
-        # `npm publish <tarball>` (NOT pnpm publish: pnpm 11 regressed OIDC;
-        # NOT from the directory: the proved bytes are the tarball). Lifecycle
-        # scripts are irrelevant for a tarball publish; --ignore-scripts makes
-        # that explicit. No NODE_AUTH_TOKEN, no .npmrc credential, no --otp:
-        # npm exchanges this job's OIDC identity for a short-lived token.
-        # --loglevel verbose: npm's oidc() helper never throws, so a failed
-        # exchange surfaces only as a downstream ENEEDAUTH/E403 unless its log
-        # lines are visible; grep for `oidc` when this step fails.
-        # NPM_CONFIG_PROVENANCE=false: npm would otherwise auto-attest this
-        # public relay commit as the build source, which contains no source.
-        # The private SHA is in the step summary for correlation.
-        working-directory: packages/sift-q
-        env:
-          NPM_CONFIG_PROVENANCE: 'false'
+          NPM_CONFIG_PROVENANCE: "false"
         run: npm publish "$PUBLISH_TARBALL" --ignore-scripts --access public --loglevel verbose
 
-      - name: verify the registry now serves the published version as latest
+      - name: verify npm latest and record the source SHA
         env:
-          VERSION: ${{ needs.build.outputs.version }}
-          SHA: ${{ needs.build.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.select.outputs.source_sha }}
+          VERSION: ${{ needs.select.outputs.version }}
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5 6; do
             LATEST=$(npm view "$PACKAGE" dist-tags.latest 2>/dev/null || true)
             if [ "$LATEST" = "$VERSION" ]; then
-              echo "$PACKAGE@$VERSION is latest."
               {
-                echo "## published $PACKAGE@$VERSION to latest"
+                echo "## published $PACKAGE@$VERSION"
                 echo
-                echo "- source: $SOURCE_REPO @ $SHA"
-                echo "- https://www.npmjs.com/package/@sift-wiki/q/v/$VERSION"
-                echo "- rollback = roll forward: land a fix on main, bump the version, dispatch again."
+                echo "- exact development source: $SOURCE_REPO @ $SOURCE_SHA"
+                echo "- registry: https://www.npmjs.com/package/@sift-wiki/q/v/$VERSION"
               } >>"$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            echo "attempt $attempt: dist-tags.latest is '${LATEST:-<unreadable>}', expected '$VERSION'; waiting 10s"
+            echo "attempt $attempt: latest is ${LATEST:-unreadable}; waiting 10 seconds"
             sleep 10
           done
-          echo "publish did not land as latest within ~60s"
+          echo "publish did not become latest within about 60 seconds"
           exit 1
 
   lint-run-logs:
     name: lint job logs for ignored action inputs
-    # An unknown `with:` key on an action is NOT an error to the runner — it
-    # logs "Unexpected input(s)" and carries on, which is how `single-branch`
-    # silently did nothing while invariant tests certified it. This job reads
-    # the completed jobs' logs of THIS run and fails if that warning appears,
-    # so a no-op input can never again pass as a control. It runs after build
-    # and publish whatever their result (a cancelled run has nothing to lint),
-    # holds no secret and no id-token, and never touches the private source.
-    needs: [build, publish]
-    if: ${{ always() && needs.build.result != 'skipped' && needs.build.result != 'cancelled' }}
+    needs: [select, publish]
+    if: ${{ always() && needs.select.result != 'skipped' && needs.select.result != 'cancelled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -538,36 +335,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SELF: ${{ github.job }}
         run: |
           set -euo pipefail
           FAIL=0
           SCANNED=0
-          # Fetch the job list first and refuse if it cannot be read or is
-          # empty: a transient API error must never produce a silent pass.
           JOBS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
-                   --jq '.jobs[] | [.id, .name, .status, (.conclusion // "")] | @tsv') || { echo "::error::cannot list this run's jobs"; exit 1; }
+                   --jq '.jobs[] | [.id, .name, .status, (.conclusion // "")] | @tsv') || {
+            echo "::error::cannot list this run's jobs"; exit 1;
+          }
           test -n "$JOBS" || { echo "::error::job list is empty"; exit 1; }
-          # The needle is assembled at runtime so this job's own echoed
-          # script (a re-run sees it completed) never matches itself.
           NEEDLE='Unexpected input''(s)'
-          # Logs are fetched with curl: `gh api` refuses bodies containing
-          # terminal escape sequences (every job log has them), and a skipped
-          # job has no log at all (404), so skipped jobs are skipped by
-          # conclusion, not by status.
           while IFS=$'\t' read -r ID NAME STATUS CONCLUSION; do
-            if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" = "skipped" ]; then
-              echo "skip $NAME (status $STATUS, conclusion ${CONCLUSION:-none})"; continue
-            fi
+            if [ "$STATUS" != completed ] || [ "$CONCLUSION" = skipped ]; then continue; fi
             LOG=$(curl -sSfL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-                    "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/jobs/$ID/logs") || { echo "cannot read log of $NAME"; FAIL=1; continue; }
+                    "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/jobs/$ID/logs") || {
+              echo "cannot read log of $NAME"; FAIL=1; continue;
+            }
             test -n "$LOG" || { echo "empty log for $NAME"; FAIL=1; continue; }
-            if printf '%s' "$LOG" | grep -nF "$NEEDLE" ; then
-              echo "::error::job '$NAME' logged '$NEEDLE': an action ignored a with: key"
+            if printf '%s' "$LOG" | grep -nF "$NEEDLE"; then
+              echo "::error::job '$NAME' ignored an action input"
               FAIL=1
             else
-              echo "ok: $NAME ($(printf '%s' "$LOG" | wc -l) lines scanned)"; SCANNED=$((SCANNED+1))
+              SCANNED=$((SCANNED+1))
             fi
           done <<<"$JOBS"
           test "$SCANNED" -ge 1 || { echo "::error::no completed job log was scanned"; exit 1; }
-          exit $FAIL
+          exit "$FAIL"
