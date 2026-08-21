@@ -54,3 +54,22 @@ workflow it holds:
 - The lane has a kill switch: the `production` environment variable `NPM_PUBLISHER_LANE`
   must equal `github-actions-oidc` or the first step refuses. Environment admins can flip it
   without a workflow edit.
+
+## Break glass
+
+The two-person rule (required reviewer ≠ dispatcher) has three reviewers — Unobtainiumrock,
+goodnight000, siftwiki — so one person's absence never blocks a release. If *no* second reviewer is
+reachable and a release cannot wait, an admin lifts the rule for one window:
+
+```
+ops/break-glass.sh status                      # what is the rule right now
+ops/break-glass.sh open "hotfix 0.9.x, <who> unreachable"   # lifts the reviewer rule; reason is recorded
+#   ...dispatch and publish...
+ops/break-glass.sh close                       # restores the three reviewers, no self-review, no admin bypass
+```
+
+While the glass is open, every other control still applies: `main`-only branch policy, the kill
+switch, the guard, OIDC, and the SHA-pinned workflow behind reviewed pull requests. Only the second
+human is removed. Both mutations are in GitHub's audit log under the caller's account and in
+`~/.local/state/sift-q-release/break-glass.log`; `open` and `close` each verify the live state and
+fail loudly rather than report a request as success. `close` is idempotent — run it whenever in doubt.
