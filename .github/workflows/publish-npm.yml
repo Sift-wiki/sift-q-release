@@ -133,9 +133,16 @@ jobs:
 
       # Check the PRIVATE source out into the workspace root so every
       # working-directory below is the same path it would be in that repo.
-      # fetch-depth 0 + single-branch: full history of main only, so origin/main
-      # is a real ref for the guard and the private repo's other branch names
-      # never appear in this public log. actions/checkout keeps the token in
+      # fetch-depth 1 with `ref: main`: ONLY main is fetched, so the private
+      # repo's other branch names never appear in this public log.
+      # `fetch-depth: 0` is what leaked them — actions/checkout documents it as
+      # "all history for all branches and tags", and it fetches
+      # +refs/heads/*:refs/remotes/origin/*. (`single-branch` is NOT an
+      # actions/checkout input; it was silently ignored and the list still
+      # printed. Verified against the action's own action.yml and a real run.)
+      # Depth 1 is enough: the guard only runs `remote get-url`, `fetch origin
+      # main`, `rev-parse HEAD`, `rev-parse origin/main`, and `status
+      # --porcelain` — no history walk. actions/checkout keeps the token in
       # http.extraheader (a file under RUNNER_TEMP), NOT in the remote URL, so
       # `git remote get-url origin` returns the plain URL that the guard's
       # CANONICAL_ORIGINS allowlist accepts. Credentials stay persisted because
@@ -145,8 +152,7 @@ jobs:
           repository: Sift-wiki/sift-q-refactor
           token: ${{ secrets.SIFT_Q_READ_TOKEN }}
           ref: main
-          fetch-depth: 0
-          single-branch: true
+          fetch-depth: 1
           persist-credentials: true
 
       - name: prove the remote URL the guard will see
@@ -335,13 +341,14 @@ jobs:
       # Fresh checkout: the guard's exact-main, clean-tree, and CI/gates checks
       # run again here, right before the write, against live origin/main. If
       # main moved since `build`, the guard (and the SHA check below) refuse.
+      # fetch-depth 1 for the same reason as the build job: depth 0 fetches
+      # every branch and prints their names into this public log.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Sift-wiki/sift-q-refactor
           token: ${{ secrets.SIFT_Q_READ_TOKEN }}
           ref: main
-          fetch-depth: 0
-          single-branch: true
+          fetch-depth: 1
           persist-credentials: true
 
       - name: refuse if main moved since the build job

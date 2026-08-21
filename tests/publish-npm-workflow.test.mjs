@@ -80,8 +80,15 @@ test('source checkout: private repo, read token, main only, full history of that
     assert.match(withBlock, /repository: Sift-wiki\/sift-q-refactor/);
     assert.match(withBlock, /token: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
     assert.match(withBlock, /ref: main/);
-    assert.match(withBlock, /fetch-depth: 0/);
-    assert.match(withBlock, /single-branch: true/);
+    // fetch-depth 1, NOT 0: actions/checkout documents 0 as "all history for
+    // all branches and tags" and it fetches +refs/heads/*, which printed the
+    // private repo's entire branch list into this public log. `single-branch`
+    // is not an actions/checkout input at all — it was silently ignored, and
+    // an earlier version of this test pinned it, which gave false assurance.
+    // Depth 1 with `ref: main` fetches only main; the guard needs no history.
+    assert.match(withBlock, /fetch-depth: 1/);
+    assert.doesNotMatch(withBlock, /fetch-depth: 0/);
+    assert.doesNotMatch(withBlock, /single-branch/);
   }
 });
 
