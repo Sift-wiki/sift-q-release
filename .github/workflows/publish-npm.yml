@@ -183,6 +183,7 @@ jobs:
         working-directory: packages/sift-q
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           VERSION=$(node -p 'require("./package.json").version')
@@ -197,6 +198,7 @@ jobs:
             exit 1
           }
           node -e '
+            (() => {
             const [version, body] = process.argv.slice(1);
             let versions;
             try { versions = JSON.parse(body); } catch { versions = undefined; }
@@ -206,6 +208,16 @@ jobs:
               process.exit(1);
             }
             if (versions.includes(version)) {
+              if (process.env.DRY_RUN === "true") {
+                // A dry run writes nothing, so an already-published version is
+                // not a reason to stop: exercising checkout, canary, and guard
+                // against the current main is exactly what a dry run is for.
+                console.error(
+                  "note: " + version + " is already on the registry; continuing because this is a " +
+                    "dry run. A real publish of this SHA would refuse here.",
+                );
+                return;
+              }
               console.error(
                 "refusing: " + version + " is already on the registry and npm versions are " +
                   "immutable. Bump packages/sift-q/package.json, land it on main, and dispatch again.",
@@ -213,6 +225,7 @@ jobs:
               process.exit(1);
             }
             console.error(version + " is not on the registry yet.");
+            })();
           ' "$VERSION" "$PUBLISHED"
           echo "PUBLISH_VERSION=$VERSION" >>"$GITHUB_ENV"
 
