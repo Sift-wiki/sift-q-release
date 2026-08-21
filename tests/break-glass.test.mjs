@@ -21,8 +21,29 @@ test('open verifies the rule is gone and fails loudly if not', () => {
   assert.match(f, /record open-FAILED/);
 });
 
-test('close restores exactly the canonical reviewers with no self-review and no admin bypass, and verifies it', () => {
-  assert.match(sh, /REVIEWERS=\(Unobtainiumrock goodnight000 siftwiki\)/);
+test('the canonical reviewer list matches README and the live rule (orange-juice-1024, not siftwiki)', () => {
+  assert.match(sh, /REVIEWERS=\(Unobtainiumrock goodnight000 orange-juice-1024\)/);
+  assert.doesNotMatch(sh, /siftwiki/);
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  assert.match(readme, /Unobtainiumrock,\s*goodnight000,\s*orange-juice-1024/);
+  assert.doesNotMatch(readme, /siftwiki/);
+});
+
+test('open snapshots the live reviewer set and close restores the snapshot, not the hardcoded list', () => {
+  assert.match(fn('open_glass'), /live=\$\(live_reviewers\)/);
+  assert.match(fn('open_glass'), />"\$SNAPSHOT"/);
+  const r = fn('restore_set');
+  assert.match(r, /read -r -a RESTORE <"\$SNAPSHOT"/);
+  assert.match(r, /RESTORE=\("\$\{REVIEWERS\[@\]\}"\)/, 'canonical list is the fallback only');
+  assert.match(r, /WARNING: restoring the snapshot/);
+  const c = fn('close_glass');
+  assert.match(c, /^\s*restore_set$/m);
+  assert.match(c, /WANT="\$\{RESTORE\[\*\]\}"/);
+  assert.doesNotMatch(c, /REVIEWERS\[/, 'close never reads the hardcoded list directly');
+  assert.match(fn('reviewer_payload'), /"\$\{RESTORE\[@\]\}"/);
+});
+
+test('close restores the reviewers with no self-review and no admin bypass, and verifies it', () => {
   const p = fn('reviewer_payload');
   assert.match(p, /"prevent_self_review":true/);
   assert.match(p, /"can_admins_bypass":false/);

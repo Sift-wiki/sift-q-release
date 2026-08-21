@@ -19,9 +19,14 @@ set -euo pipefail
 
 REPO="Sift-wiki/sift-q-release"
 ENV_NAME="production"
-# The canonical reviewer set. Keep in sync with README.md "Repository posture".
-REVIEWERS=(Unobtainiumrock goodnight000 siftwiki)
+# The canonical reviewer set. Keep in sync with README.md "Break glass". This
+# is the FALLBACK only: `open` snapshots the live reviewer set first and
+# `close` restores that snapshot, so a stale list here cannot silently add or
+# drop a reviewer on close (a drill against a stale list would have re-added
+# a departed account and removed a current one).
+REVIEWERS=(Unobtainiumrock goodnight000 orange-juice-1024)
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sift-q-release"
+SNAPSHOT="$LOG_DIR/reviewers.snapshot"
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
@@ -46,6 +51,10 @@ print("can_admins_bypass:", d.get("can_admins_bypass"))
 bp=d.get("deployment_branch_policy") or {}
 print("branch policy:", "custom" if bp.get("custom_branch_policies") else bp)
 '
+  local live; live=$(live_reviewers)
+  if [[ -n "$live" ]] && ! same_set "$live" "${REVIEWERS[*]}"; then
+    echo "WARNING: live reviewers {$live} differ from this script's canonical list {${REVIEWERS[*]}}; update REVIEWERS and README.md." >&2
+  fi
 }
 
 record() {
@@ -53,9 +62,35 @@ record() {
   printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(gh api user --jq .login)" "$1" "${2:-}" >>"$LOG_DIR/break-glass.log"
 }
 
+# Set equality in python: shell `sort` is locale-aware and case handling
+# differs from python's sorted(), which bit the first version of `status`.
+same_set() { python3 -c 'import sys; sys.exit(0 if set(sys.argv[1].split())==set(sys.argv[2].split()) else 1)' "$1" "$2"; }
+
+live_reviewers() {
+  env_json | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+rr=[r for r in d.get("protection_rules",[]) if r["type"]=="required_reviewers"]
+print(" ".join(sorted(x["reviewer"]["login"] for x in rr[0]["reviewers"])) if rr else "")'
+}
+
+# The set `close` restores: the snapshot `open` took of the live rule, else
+# the canonical list. Warn when the two disagree — that is README drift.
+restore_set() {
+  local live
+  if [[ -s "$SNAPSHOT" ]]; then
+    read -r -a RESTORE <"$SNAPSHOT"
+  else
+    RESTORE=("${REVIEWERS[@]}")
+  fi
+  if ! same_set "${RESTORE[*]}" "${REVIEWERS[*]}"; then
+    echo "WARNING: restoring the snapshot {${RESTORE[*]}}, which differs from the canonical list {${REVIEWERS[*]}} in this script. Update REVIEWERS and README.md." >&2
+  fi
+}
+
 reviewer_payload() {
   local ids=() u
-  for u in "${REVIEWERS[@]}"; do ids+=("{\"type\":\"User\",\"id\":$(gh api "users/$u" --jq .id)}"); done
+  for u in "${RESTORE[@]}"; do ids+=("{\"type\":\"User\",\"id\":$(gh api "users/$u" --jq .id)}"); done
   local joined; joined=$(IFS=,; echo "${ids[*]}")
   printf '{"prevent_self_review":true,"reviewers":[%s],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true},"can_admins_bypass":false}' "$joined"
 }
@@ -64,6 +99,15 @@ open_glass() {
   local reason="${1:-}"
   [[ -n "$reason" ]] || { echo "open needs a REASON (it is recorded): ops/break-glass.sh open 'hotfix 0.9.8, goodnight000 unreachable'" >&2; exit 2; }
   echo "Lifting the reviewer rule on $REPO/$ENV_NAME. Branch policy, kill switch, guard, and OIDC stay in force."
+  # Snapshot the LIVE reviewer set so close restores what was actually there.
+  mkdir -p "$LOG_DIR"
+  local live; live=$(live_reviewers)
+  if [[ -n "$live" ]]; then
+    printf '%s\n' "$live" >"$SNAPSHOT"
+    echo "snapshot of live reviewers: $live"
+  else
+    echo "note: no reviewer rule is present now; close will restore the canonical list."
+  fi
   # GitHub's PUT only replaces the keys it receives: omitting `reviewers`
   # leaves the existing rule in place (verified in the first drill). An
   # explicit empty list is what removes it.
@@ -83,21 +127,23 @@ JSON
 }
 
 close_glass() {
-  echo "Restoring reviewers (${REVIEWERS[*]}), prevent_self_review=true, can_admins_bypass=false."
+  restore_set
+  echo "Restoring reviewers (${RESTORE[*]}), prevent_self_review=true, can_admins_bypass=false."
   reviewer_payload | gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input - >/dev/null
   # Verify in one place (python), comparing as sets: shell `sort` is
   # locale-aware and would disagree with any other ordering.
-  if ! env_json | WANT="${REVIEWERS[*]}" python3 -c '
+  if ! env_json | WANT="${RESTORE[*]}" python3 -c '
 import json,os,sys
 d=json.load(sys.stdin)
 rr=[r for r in d.get("protection_rules",[]) if r["type"]=="required_reviewers"]
 ok = bool(rr) and rr[0].get("prevent_self_review") is True and d.get("can_admins_bypass") is False \
      and {x["reviewer"]["login"] for x in rr[0]["reviewers"]} == set(os.environ["WANT"].split())
 sys.exit(0 if ok else 1)'; then
-    echo "ERROR: after close the reviewer rule does not match {${REVIEWERS[*]}} + prevent_self_review + no admin bypass." >&2
+    echo "ERROR: after close the reviewer rule does not match {${RESTORE[*]}} + prevent_self_review + no admin bypass." >&2
     record close-FAILED
     exit 1
   fi
+  rm -f "$SNAPSHOT"
   record close
   show
 }

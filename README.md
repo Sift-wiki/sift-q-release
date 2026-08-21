@@ -58,7 +58,7 @@ workflow it holds:
 ## Break glass
 
 The two-person rule (required reviewer ≠ dispatcher) has three reviewers — Unobtainiumrock,
-goodnight000, siftwiki — so one person's absence never blocks a release. If *no* second reviewer is
+goodnight000, orange-juice-1024 — so one person's absence never blocks a release. If *no* second reviewer is
 reachable and a release cannot wait, an admin lifts the rule for one window:
 
 ```
