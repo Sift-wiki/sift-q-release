@@ -1,7 +1,13 @@
 # Review from a code owner is required (branch ruleset) for every change.
 # The workflow is the trust root of the npm lane; its tests and this file
 # travel with it.
-/.github/workflows/   @Unobtainiumrock @goodnight000
-/tests/               @Unobtainiumrock @goodnight000
-/.github/CODEOWNERS   @Unobtainiumrock @goodnight000
-*                     @Unobtainiumrock @goodnight000
+#
+# Three owners, not two, and the reason matters: the agent that opens most of
+# these pull requests authenticates as @Unobtainiumrock, so every such PR is
+# authored by that account and GitHub refuses to let it self-approve. With two
+# owners that left exactly one person who could ever unblock a change. A third
+# owner removes that single point of dependence without weakening the rule.
+/.github/workflows/   @Unobtainiumrock @goodnight000 @orange-juice-1024
+/tests/               @Unobtainiumrock @goodnight000 @orange-juice-1024
+/.github/CODEOWNERS   @Unobtainiumrock @goodnight000 @orange-juice-1024
+*                     @Unobtainiumrock @goodnight000 @orange-juice-1024
