@@ -519,7 +519,7 @@ jobs:
           exit 1
 
   lint-run-logs:
-    name: fail on "Unexpected input(s)" in any job log
+    name: lint job logs for ignored action inputs
     # An unknown `with:` key on an action is NOT an error to the runner — it
     # logs "Unexpected input(s)" and carries on, which is how `single-branch`
     # silently did nothing while invariant tests certified it. This job reads
@@ -542,15 +542,32 @@ jobs:
         run: |
           set -euo pipefail
           FAIL=0
-          while IFS=$'\t' read -r ID NAME STATUS; do
-            [ "$STATUS" = "completed" ] || { echo "skip $NAME (status $STATUS)"; continue; }
-            LOG=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$ID/logs") || { echo "cannot read log of $NAME"; FAIL=1; continue; }
-            if printf '%s' "$LOG" | grep -n 'Unexpected input(s)' ; then
-              echo "::error::job '$NAME' logged 'Unexpected input(s)': an action ignored a with: key"
+          SCANNED=0
+          # Fetch the job list first and refuse if it cannot be read or is
+          # empty: a transient API error must never produce a silent pass.
+          JOBS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+                   --jq '.jobs[] | [.id, .name, .status, (.conclusion // "")] | @tsv') || { echo "::error::cannot list this run's jobs"; exit 1; }
+          test -n "$JOBS" || { echo "::error::job list is empty"; exit 1; }
+          # The needle is assembled at runtime so this job's own echoed
+          # script (a re-run sees it completed) never matches itself.
+          NEEDLE='Unexpected input''(s)'
+          # Logs are fetched with curl: `gh api` refuses bodies containing
+          # terminal escape sequences (every job log has them), and a skipped
+          # job has no log at all (404), so skipped jobs are skipped by
+          # conclusion, not by status.
+          while IFS=$'\t' read -r ID NAME STATUS CONCLUSION; do
+            if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" = "skipped" ]; then
+              echo "skip $NAME (status $STATUS, conclusion ${CONCLUSION:-none})"; continue
+            fi
+            LOG=$(curl -sSfL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/jobs/$ID/logs") || { echo "cannot read log of $NAME"; FAIL=1; continue; }
+            test -n "$LOG" || { echo "empty log for $NAME"; FAIL=1; continue; }
+            if printf '%s' "$LOG" | grep -nF "$NEEDLE" ; then
+              echo "::error::job '$NAME' logged '$NEEDLE': an action ignored a with: key"
               FAIL=1
             else
-              echo "ok: $NAME"
+              echo "ok: $NAME ($(printf '%s' "$LOG" | wc -l) lines scanned)"; SCANNED=$((SCANNED+1))
             fi
-          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
-                    --jq '.jobs[] | [.id, .name, .status] | @tsv')
+          done <<<"$JOBS"
+          test "$SCANNED" -ge 1 || { echo "::error::no completed job log was scanned"; exit 1; }
           exit $FAIL

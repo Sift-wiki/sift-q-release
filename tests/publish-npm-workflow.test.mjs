@@ -117,9 +117,16 @@ test('lint-run-logs fails the run on "Unexpected input(s)" in any completed job 
   assert.match(lintJob, /permissions:\n\s+actions: read\n/);
   assert.doesNotMatch(lintJob, /uses:|SIFT_Q_READ_TOKEN|sift-q-refactor/);
   assert.match(lintJob, /actions\/runs\/\$RUN_ID\/jobs/);
-  assert.match(lintJob, /actions\/jobs\/\$ID\/logs/);
-  assert.match(lintJob, /grep -n 'Unexpected input\(s\)'/);
+  assert.match(lintJob, /curl -sSfL -H "Authorization: Bearer \$GH_TOKEN"[^\n]*\n[^\n]*actions\/jobs\/\$ID\/logs/);
+  assert.match(lintJob, /\[ "\$CONCLUSION" = "skipped" \]/);
+  assert.match(lintJob, /test -n "\$LOG" \|\|[^\n]*FAIL=1/);
+  assert.match(lintJob, /NEEDLE='Unexpected input''\(s\)'/);
+  assert.match(lintJob, /grep -nF "\$NEEDLE"/);
+  assert.doesNotMatch(lintJob, /Unexpected input\(s\)/, 'the literal never appears in the job (its name is in every log header; its script is echoed)');
   assert.match(lintJob, /FAIL=1/);
+  assert.match(lintJob, /cannot list this run's jobs"; exit 1/);
+  assert.match(lintJob, /test -n "\$JOBS" \|\|[^\n]*exit 1/);
+  assert.match(lintJob, /test "\$SCANNED" -ge 1 \|\|[^\n]*exit 1/);
   assert.match(lintJob, /exit \$FAIL/);
 });
 
