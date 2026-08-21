@@ -9,9 +9,14 @@ name: publish-npm
 #             deploy-development run and its one 3-file artifact. The relay's
 #             verifier checks run/repository/workflow/main lineage, both signed
 #             receipts, source/tree/receipt/tarball digests and package metadata.
-#   publish — no private-repository token or checkout. It receives only the
+#   publish — no private-repository token or private checkout. It receives only the
 #             verified tarball, rechecks its digest and registry absence, and is
-#             the sole job allowed to request an npm OIDC token.
+#             the sole job allowed to request an npm OIDC token. It publishes
+#             under `next`. It never executes candidate code.
+#   verify-registry — no id-token, private token, environment, or write authority.
+#             It checks out only this public verifier, fetches the registry-served
+#             bytes through canonical npm, byte-compares and canaries them, then
+#             re-reads both tags and emits non-authoritative transition evidence.
 #
 # Required candidate-selection environment configuration:
 #   variable CANDIDATE_SELECTION_LANE=exact-development-candidate
@@ -64,8 +69,12 @@ jobs:
     permissions:
       contents: read
     outputs:
+      candidate_receipt_digest: ${{ steps.candidate.outputs.candidate_receipt_digest }}
+      run_attempt: ${{ steps.candidate.outputs.run_attempt }}
+      run_id: ${{ steps.candidate.outputs.run_id }}
       source_sha: ${{ steps.candidate.outputs.source_sha }}
       tarball_sha256: ${{ steps.candidate.outputs.tarball_sha256 }}
+      tree_sha: ${{ steps.candidate.outputs.tree_sha }}
       version: ${{ steps.candidate.outputs.version }}
     steps:
       - name: refuse unless the lane is switched on
@@ -184,9 +193,17 @@ jobs:
           VERSION=$(node -p 'require(process.argv[1]).version' "$BOUNDARY/verified.json")
           SOURCE_SHA=$(node -p 'require(process.argv[1]).sourceSha' "$BOUNDARY/verified.json")
           TARBALL_SHA256=$(node -p 'require(process.argv[1]).tarballSha256' "$BOUNDARY/verified.json")
+          TREE_SHA=$(node -p 'require(process.argv[1]).treeSha' "$BOUNDARY/verified.json")
+          RUN_ID=$(node -p 'require(process.argv[1]).runId' "$BOUNDARY/verified.json")
+          RUN_ATTEMPT=$(node -p 'require(process.argv[1]).runAttempt' "$BOUNDARY/verified.json")
+          CANDIDATE_RECEIPT_DIGEST=$(node -p 'require(process.argv[1]).candidateReceiptDigest' "$BOUNDARY/verified.json")
           echo "version=$VERSION" >>"$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >>"$GITHUB_OUTPUT"
           echo "tarball_sha256=$TARBALL_SHA256" >>"$GITHUB_OUTPUT"
+          echo "tree_sha=$TREE_SHA" >>"$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >>"$GITHUB_OUTPUT"
+          echo "run_attempt=$RUN_ATTEMPT" >>"$GITHUB_OUTPUT"
+          echo "candidate_receipt_digest=$CANDIDATE_RECEIPT_DIGEST" >>"$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/verified-artifact"
           cp "$RUNNER_TEMP/development-candidate/npm-package.tgz" \
             "$RUNNER_TEMP/verified-artifact/sift-wiki-q-$VERSION.tgz"
@@ -250,6 +267,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      latest_before: ${{ steps.registry_preflight.outputs.latest_before }}
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      NPM_CONFIG_USERCONFIG: /dev/null
     steps:
       - name: refuse unless the npm OIDC lane is switched on
         env:
@@ -269,8 +291,13 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          npm install -g --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
-          test "$(npm --version)" = "$NPM_VERSION"
+          npm_prefix="$RUNNER_TEMP/npm-pinned"
+          npm install -g --prefix "$npm_prefix" --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
+          echo "$npm_prefix/bin" >> "$GITHUB_PATH"
+          test "$("$npm_prefix/bin/npm" --version)" = "$NPM_VERSION" || {
+            echo "refusing: npm version mismatch"
+            exit 1
+          }
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -278,6 +305,7 @@ jobs:
           path: ${{ runner.temp }}/verified-artifact
 
       - name: reverify the selected bytes and registry absence
+        id: registry_preflight
         env:
           EXPECTED_SHA256: ${{ needs.select.outputs.tarball_sha256 }}
           VERSION: ${{ needs.select.outputs.version }}
@@ -291,6 +319,22 @@ jobs:
           }
           ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
           test "$ACTUAL" = "$EXPECTED_SHA256" || { echo "refusing: tarball changed after selection"; exit 1; }
+          LATEST_BEFORE=$(npm view "$PACKAGE" dist-tags.latest) || {
+            echo "refusing: cannot read the existing latest tag"
+            exit 1
+          }
+          node -e '
+            if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.argv[1])) process.exit(1);
+          ' "$LATEST_BEFORE" || { echo "refusing: existing latest tag is invalid"; exit 1; }
+          node -e '
+            const parse = value => value.split(".").map(BigInt);
+            const [candidate, latest] = process.argv.slice(1).map(parse);
+            for (let i = 0; i < 3; i += 1) {
+              if (candidate[i] > latest[i]) process.exit(0);
+              if (candidate[i] < latest[i]) process.exit(1);
+            }
+            process.exit(1);
+          ' "$VERSION" "$LATEST_BEFORE" || { echo "refusing: candidate version does not advance latest"; exit 1; }
           PUBLISHED=$(npm view "$PACKAGE" versions --json) || {
             echo "refusing: cannot read $PACKAGE versions from npm"
             exit 1
@@ -309,38 +353,184 @@ jobs:
             exit 1
           }
           echo "PUBLISH_TARBALL=$TARBALL" >>"$GITHUB_ENV"
+          echo "LATEST_BEFORE=$LATEST_BEFORE" >>"$GITHUB_ENV"
+          echo "latest_before=$LATEST_BEFORE" >>"$GITHUB_OUTPUT"
 
-      - name: publish the exact candidate with OIDC trusted publishing
+      - name: publish the exact candidate to next with OIDC trusted publishing
         env:
           NPM_CONFIG_PROVENANCE: "false"
-        run: npm publish "$PUBLISH_TARBALL" --ignore-scripts --access public --loglevel verbose
+        run: npm publish "$PUBLISH_TARBALL" --tag next --ignore-scripts --access public --loglevel verbose
 
-      - name: verify npm latest and record the source SHA
+  verify-registry:
+    name: verify registry bytes without write authority
+    needs: [select, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      NPM_CONFIG_USERCONFIG: /dev/null
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: install the exact read-only npm client
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          npm_prefix="$RUNNER_TEMP/npm-pinned"
+          npm install -g --prefix "$npm_prefix" --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
+          echo "$npm_prefix/bin" >> "$GITHUB_PATH"
+          test "$("$npm_prefix/bin/npm" --version)" = "$NPM_VERSION" || {
+            echo "refusing: npm version mismatch"
+            exit 1
+          }
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: exact-candidate-tarball
+          path: ${{ runner.temp }}/verified-artifact
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: relay
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: fetch registry bytes, run the clean canary, and record the next transition
+        id: transition
         env:
+          CANDIDATE_RECEIPT_DIGEST: ${{ needs.select.outputs.candidate_receipt_digest }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.select.outputs.run_attempt }}
+          CANDIDATE_RUN_ID: ${{ needs.select.outputs.run_id }}
+          EXPECTED_SHA256: ${{ needs.select.outputs.tarball_sha256 }}
+          LATEST_BEFORE: ${{ needs.publish.outputs.latest_before }}
           SOURCE_SHA: ${{ needs.select.outputs.source_sha }}
+          TREE_SHA: ${{ needs.select.outputs.tree_sha }}
           VERSION: ${{ needs.select.outputs.version }}
         run: |
           set -euo pipefail
+          umask 077
+          test "$(git -C relay rev-parse HEAD)" = "$GITHUB_SHA" || {
+            echo "refusing: public verifier checkout differs from the dispatched release SHA"
+            exit 1
+          }
+          TARBALL="$RUNNER_TEMP/verified-artifact/sift-wiki-q-$VERSION.tgz"
+          test -f "$TARBALL" && test ! -L "$TARBALL" || {
+            echo "refusing: exact tarball missing from no-authority verifier"
+            exit 1
+          }
+          test "$(find "$RUNNER_TEMP/verified-artifact" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 1 || {
+            echo "refusing: verified artifact contains unexpected files"
+            exit 1
+          }
+          test "$(sha256sum "$TARBALL" | cut -d' ' -f1)" = "$EXPECTED_SHA256" || {
+            echo "refusing: tarball changed before no-authority verification"
+            exit 1
+          }
+          TRANSITION_DIR=$(mktemp -d "$RUNNER_TEMP/npm-next-transition.XXXXXX")
+          REGISTRY_DIR=$(mktemp -d "$RUNNER_TEMP/npm-registry-bytes.XXXXXX")
+          READY=false
           for attempt in 1 2 3 4 5 6; do
-            LATEST=$(npm view "$PACKAGE" dist-tags.latest 2>/dev/null || true)
-            if [ "$LATEST" = "$VERSION" ]; then
-              {
-                echo "## published $PACKAGE@$VERSION"
-                echo
-                echo "- exact development source: $SOURCE_REPO @ $SOURCE_SHA"
-                echo "- registry: https://www.npmjs.com/package/@sift-wiki/q/v/$VERSION"
-              } >>"$GITHUB_STEP_SUMMARY"
-              exit 0
+            if npm view "$PACKAGE@$VERSION" --json >/dev/null; then
+              NEXT=$(npm view "$PACKAGE" dist-tags.next 2>/dev/null || true)
+              if [ "$NEXT" = "$VERSION" ]; then
+                READY=true
+                break
+              fi
             fi
-            echo "attempt $attempt: latest is ${LATEST:-unreadable}; waiting 10 seconds"
+            echo "attempt $attempt: exact version or next tag not yet visible; waiting 10 seconds"
             sleep 10
           done
-          echo "publish did not become latest within about 60 seconds"
-          exit 1
+          test "$READY" = true || { echo "refusing: published version did not become visible as next"; exit 1; }
+          npm pack "$PACKAGE@$VERSION" --ignore-scripts --json --pack-destination "$REGISTRY_DIR" \
+            >"$TRANSITION_DIR/npm-pack.json"
+          REGISTRY_TARBALL=$(node -e '
+            const path = require("node:path");
+            const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            if (!Array.isArray(value) || value.length !== 1 ||
+                typeof value[0]?.filename !== "string" ||
+                path.basename(value[0].filename) !== value[0].filename ||
+                !value[0].filename.endsWith(".tgz")) process.exit(1);
+            process.stdout.write(path.join(process.argv[2], value[0].filename));
+          ' "$TRANSITION_DIR/npm-pack.json" "$REGISTRY_DIR") || {
+            echo "refusing: npm pack did not return one safe tarball filename"
+            exit 1
+          }
+          test -f "$REGISTRY_TARBALL" && test ! -L "$REGISTRY_TARBALL" || {
+            echo "refusing: registry tarball is not one regular file"
+            exit 1
+          }
+          node relay/scripts/verify-registry-transition.mjs canary \
+            --registry-tarball "$REGISTRY_TARBALL" --version "$VERSION" \
+            --output "$TRANSITION_DIR/registry-canary.json" \
+            >"$TRANSITION_DIR/canary-result.json"
+          npm view "$PACKAGE@$VERSION" --json >"$TRANSITION_DIR/registry-package.json"
+          NEXT_AFTER_CANARY=$(npm view "$PACKAGE" dist-tags.next) || {
+            echo "refusing: cannot read next after the registry canary"
+            exit 1
+          }
+          test "$NEXT_AFTER_CANARY" = "$VERSION" || {
+            echo "refusing: next changed during the registry canary"
+            exit 1
+          }
+          LATEST_AFTER_CANARY=$(npm view "$PACKAGE" dist-tags.latest) || {
+            echo "refusing: cannot read latest after the registry canary"
+            exit 1
+          }
+          test "$LATEST_AFTER_CANARY" = "$LATEST_BEFORE" || {
+            echo "refusing: latest changed during next publication or canary"
+            exit 1
+          }
+          node relay/scripts/verify-registry-transition.mjs record \
+            --selected-tarball "$TARBALL" \
+            --registry-tarball "$REGISTRY_TARBALL" \
+            --registry-metadata "$TRANSITION_DIR/registry-package.json" \
+            --canary "$TRANSITION_DIR/registry-canary.json" \
+            --source-sha "$SOURCE_SHA" --tree-sha "$TREE_SHA" \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --candidate-receipt-digest "$CANDIDATE_RECEIPT_DIGEST" \
+            --latest-before "$LATEST_BEFORE" --latest-after "$LATEST_AFTER_CANARY" \
+            --version "$VERSION" --next-tag-version "$NEXT_AFTER_CANARY" \
+            --output "$TRANSITION_DIR/npm-next-transition.json" \
+            --promotion-binding-output "$TRANSITION_DIR/npm-latest-promotion-binding.json" \
+            >"$TRANSITION_DIR/transition-result.json"
+          TRANSITION_DIGEST=$(node -p 'require(process.argv[1]).transitionEvidenceDigest' \
+            "$TRANSITION_DIR/transition-result.json")
+          echo "transition_evidence_digest=$TRANSITION_DIGEST" >>"$GITHUB_OUTPUT"
+          echo "transition_directory=$TRANSITION_DIR" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-next-transition-${{ needs.select.outputs.version }}
+          path: |
+            ${{ steps.transition.outputs.transition_directory }}/npm-next-transition.json
+            ${{ steps.transition.outputs.transition_directory }}/npm-latest-promotion-binding.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: next transition summary
+        env:
+          SOURCE_SHA: ${{ needs.select.outputs.source_sha }}
+          TRANSITION_DIGEST: ${{ steps.transition.outputs.transition_evidence_digest }}
+          VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          {
+            echo "## published and canaried $PACKAGE@$VERSION on next"
+            echo
+            echo "- exact development source: $SOURCE_REPO @ $SOURCE_SHA"
+            echo "- registry bytes: equal to the selected candidate and clean-HOME canary passed"
+            echo "- transition evidence: $TRANSITION_DIGEST (unsigned and non-authoritative)"
+            echo "- latest: unchanged; a separately governed lane must verify a trusted signed promotion receipt"
+          } >>"$GITHUB_STEP_SUMMARY"
 
   lint-run-logs:
     name: lint job logs for ignored action inputs
-    needs: [select, publish]
+    needs: [select, publish, verify-registry]
     if: ${{ always() && needs.select.result != 'skipped' && needs.select.result != 'cancelled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
