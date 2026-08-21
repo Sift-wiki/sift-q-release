@@ -387,12 +387,24 @@ jobs:
         # gh, all part of the image. npm >= 11.5.1 is required for OIDC trusted
         # publishing, so install the exact pinned npm and assert it. Run from
         # RUNNER_TEMP so nothing in the checkout can intercept.
+        #
+        # Deliberately NOT `npm install -g` into the default global prefix:
+        # with no setup-node in this job (R1), that prefix is /usr/local,
+        # which is root-owned on the runner image, so a global install EACCESs
+        # trying to mkdir /usr/local/share/man/man5 (the build job's identical
+        # line succeeds only because setup-node repoints the global prefix
+        # into a runner-writable directory). Install into an explicit
+        # runner-writable prefix instead and prepend it to PATH for the rest
+        # of the job, so every later `npm` invocation in this job — including
+        # `npm publish` below — resolves to this exact pinned version.
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
           echo "system node: $(node --version)"
-          npm install -g "npm@$NPM_VERSION"
-          test "$(npm --version)" = "$NPM_VERSION" || { echo "refusing: npm $(npm --version) != $NPM_VERSION"; exit 1; }
+          npm_prefix="$RUNNER_TEMP/npm-pinned"
+          npm install -g --prefix "$npm_prefix" "npm@$NPM_VERSION"
+          echo "$npm_prefix/bin" >> "$GITHUB_PATH"
+          test "$("$npm_prefix/bin/npm" --version)" = "$NPM_VERSION" || { echo "refusing: npm version mismatch"; exit 1; }
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
