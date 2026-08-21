@@ -1,7 +1,10 @@
 # Review from a code owner is required (branch ruleset) for every change.
 # The workflow is the trust root of the npm lane; its tests and this file
 # travel with it.
-/.github/workflows/   @Unobtainiumrock @goodnight000
-/tests/               @Unobtainiumrock @goodnight000
-/.github/CODEOWNERS   @Unobtainiumrock @goodnight000
-*                     @Unobtainiumrock @goodnight000
+/.github/workflows/   @Unobtainiumrock @goodnight000 @orange-juice-1024
+/tests/               @Unobtainiumrock @goodnight000 @orange-juice-1024
+/.github/CODEOWNERS   @Unobtainiumrock @goodnight000 @orange-juice-1024
+*                     @Unobtainiumrock @goodnight000 @orange-juice-1024
+
+# Operator account added 2026-08-21 (self-sufficiency: lane maintenance without
+# blocking on a second human; publish itself is OIDC + environment-gated).
