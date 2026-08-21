@@ -87,6 +87,21 @@ jobs:
         with:
           node-version: 22
 
+      - name: require the legacy private publisher to be disabled
+        env:
+          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          BOUNDARY="$RUNNER_TEMP/candidate-boundary"
+          mkdir -p "$BOUNDARY"
+          gh api "repos/$SOURCE_REPO" >"$BOUNDARY/source-repository.json"
+          gh api "repos/$SOURCE_REPO/actions/workflows/publish-npm.yml" \
+            >"$BOUNDARY/legacy-publisher-workflow.json"
+          node relay/scripts/verify-exact-candidate.mjs verify-legacy-publisher \
+            --repository "$BOUNDARY/source-repository.json" \
+            --workflow "$BOUNDARY/legacy-publisher-workflow.json"
+
       - name: verify the private run and fetch its one exact artifact
         id: run
         env:

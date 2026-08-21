@@ -8,6 +8,9 @@ import { gunzipSync } from "node:zlib";
 export const SOURCE_REPOSITORY = "Sift-wiki/sift-q-refactor";
 export const SOURCE_REPOSITORY_ID = 1_329_084_838;
 export const SOURCE_WORKFLOW_PATH = ".github/workflows/deploy-development.yml";
+export const LEGACY_PUBLISH_WORKFLOW_ID = 339_277_809;
+export const LEGACY_PUBLISH_WORKFLOW_NAME = "publish-qualified-npm-candidate";
+export const LEGACY_PUBLISH_WORKFLOW_PATH = ".github/workflows/publish-npm.yml";
 export const CANDIDATE_ARTIFACT_NAME = "sift-q-development-candidate";
 export const CANDIDATE_FILES = Object.freeze([
   "npm-package.tgz",
@@ -124,6 +127,44 @@ export function packageManifestFromTarball(tarball) {
     "npm tarball package manifest is invalid",
   );
   return manifest;
+}
+
+export function validateLegacyPublisherDisabled(repository, workflow) {
+  invariant(
+    repository?.id === SOURCE_REPOSITORY_ID,
+    "legacy publisher repository id differs",
+  );
+  invariant(
+    repository.full_name === SOURCE_REPOSITORY,
+    "legacy publisher repository differs",
+  );
+  invariant(
+    repository.private === true && repository.default_branch === "main",
+    "legacy publisher repository posture differs",
+  );
+  invariant(
+    workflow?.id === LEGACY_PUBLISH_WORKFLOW_ID,
+    "legacy publisher workflow id differs",
+  );
+  invariant(
+    workflow.name === LEGACY_PUBLISH_WORKFLOW_NAME,
+    "legacy publisher workflow name differs",
+  );
+  invariant(
+    workflow.path === LEGACY_PUBLISH_WORKFLOW_PATH,
+    "legacy publisher workflow path differs",
+  );
+  invariant(
+    workflow.state === "disabled_manually",
+    "legacy private publisher is not disabled_manually",
+  );
+  return {
+    repository: repository.full_name,
+    repositoryId: repository.id,
+    workflowId: workflow.id,
+    workflowPath: workflow.path,
+    workflowState: workflow.state,
+  };
 }
 
 export function validateRunSelection({
@@ -417,6 +458,14 @@ function optional(values, key) {
 
 async function main(argv) {
   const { command, values } = argumentsOf(argv);
+  if (command === "verify-legacy-publisher") {
+    const result = validateLegacyPublisherDisabled(
+      jsonFile(required(values, "--repository")),
+      jsonFile(required(values, "--workflow")),
+    );
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
   if (command === "select-run") {
     const result = validateRunSelection({
       run: jsonFile(required(values, "--run")),

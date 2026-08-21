@@ -54,14 +54,18 @@ the workflow it holds:
 - `main` accepts changes only through a pull request with one approval from a code owner
   who is not the author; no bypass actors.
 - Activation is currently fail-closed: the `candidate-selection` environment does not yet
-  exist, while `production` still contains `SIFT_Q_READ_TOKEN`. Before enabling this
-  workflow, an environment administrator must create `candidate-selection`, require a
-  reviewer, forbid self-review and admin bypass, allow only `main`, and add only
+  exist, while `production` still contains `SIFT_Q_READ_TOKEN` and the private source
+  repository's legacy `.github/workflows/publish-npm.yml` is still active. Activation must
+  happen in this order: (1) disable that private workflow and verify its GitHub state is
+  `disabled_manually`; (2) create `candidate-selection`, require a reviewer, forbid
+  self-review and admin bypass, allow only `main`, and add only
   `CANDIDATE_SELECTION_LANE=exact-development-candidate`, `SIFT_Q_READ_TOKEN`, and
-  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`. After verifying that boundary live, remove
-  `SIFT_Q_READ_TOKEN` from `production`. `production` must retain its reviewer and
-  main-only protections and only `NPM_PUBLISHER_LANE=github-actions-oidc`; the npm OIDC
-  job must not receive either private-source secret.
+  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`; (3) remove `SIFT_Q_READ_TOKEN` from
+  `production`; and (4) run the first reviewed dry run. `production` must retain its
+  reviewer and main-only protections and only
+  `NPM_PUBLISHER_LANE=github-actions-oidc`; the npm OIDC job must not receive either
+  private-source secret. Every selection rechecks the exact private repository and legacy
+  workflow IDs, name, path, and `disabled_manually` state before it reads candidate bytes.
 - `tests/publish-npm-workflow.test.mjs` pins the workflow boundary: dispatch-only exact
   identifiers, `id-token` only on the publisher, no source credential in that job,
   SHA-pinned actions, exact npm, exact tarball transfer, provenance off, and kill switch

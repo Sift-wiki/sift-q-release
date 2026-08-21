@@ -16,11 +16,15 @@ import test from "node:test";
 import {
   CANDIDATE_ARTIFACT_NAME,
   CANDIDATE_FILES,
+  LEGACY_PUBLISH_WORKFLOW_ID,
+  LEGACY_PUBLISH_WORKFLOW_NAME,
+  LEGACY_PUBLISH_WORKFLOW_PATH,
   PACKAGE_REPOSITORY,
   SOURCE_REPOSITORY,
   SOURCE_REPOSITORY_ID,
   SOURCE_WORKFLOW_PATH,
   validateCandidateFiles,
+  validateLegacyPublisherDisabled,
   validateRunSelection,
   verifyCandidate,
 } from "../scripts/verify-exact-candidate.mjs";
@@ -30,6 +34,83 @@ const candidateSha = "1".repeat(40);
 const mainSha = "2".repeat(40);
 const treeSha = "4".repeat(40);
 const artifactId = 777;
+
+function validLegacyPublisher() {
+  return {
+    repository: {
+      id: SOURCE_REPOSITORY_ID,
+      full_name: SOURCE_REPOSITORY,
+      private: true,
+      default_branch: "main",
+    },
+    workflow: {
+      id: LEGACY_PUBLISH_WORKFLOW_ID,
+      name: LEGACY_PUBLISH_WORKFLOW_NAME,
+      path: LEGACY_PUBLISH_WORKFLOW_PATH,
+      state: "disabled_manually",
+    },
+  };
+}
+
+test("accepts only the disabled canonical private publisher", () => {
+  const { repository, workflow } = validLegacyPublisher();
+  assert.deepEqual(validateLegacyPublisherDisabled(repository, workflow), {
+    repository: SOURCE_REPOSITORY,
+    repositoryId: SOURCE_REPOSITORY_ID,
+    workflowId: LEGACY_PUBLISH_WORKFLOW_ID,
+    workflowPath: LEGACY_PUBLISH_WORKFLOW_PATH,
+    workflowState: "disabled_manually",
+  });
+});
+
+for (const state of ["active", "unknown"]) {
+  test(`refuses the legacy private publisher state ${state}`, () => {
+    const { repository, workflow } = validLegacyPublisher();
+    workflow.state = state;
+    assert.throws(
+      () => validateLegacyPublisherDisabled(repository, workflow),
+      /legacy private publisher is not disabled_manually/,
+    );
+  });
+}
+
+for (const [label, mutate, expected] of [
+  [
+    "repository id",
+    (value) => (value.repository.id += 1),
+    /repository id differs/,
+  ],
+  [
+    "repository name",
+    (value) => (value.repository.full_name = "Sift-wiki/other"),
+    /repository differs/,
+  ],
+  [
+    "repository posture",
+    (value) => (value.repository.private = false),
+    /repository posture differs/,
+  ],
+  ["workflow id", (value) => (value.workflow.id += 1), /workflow id differs/],
+  [
+    "workflow name",
+    (value) => (value.workflow.name = "publish-npm"),
+    /workflow name differs/,
+  ],
+  [
+    "workflow path",
+    (value) => (value.workflow.path = ".github/workflows/other.yml"),
+    /workflow path differs/,
+  ],
+]) {
+  test(`refuses legacy publisher ${label} substitution`, () => {
+    const value = validLegacyPublisher();
+    mutate(value);
+    assert.throws(
+      () => validateLegacyPublisherDisabled(value.repository, value.workflow),
+      expected,
+    );
+  });
+}
 
 function validBoundary() {
   return {

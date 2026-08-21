@@ -113,7 +113,7 @@ test("select and publish pin Node 22 with the same SHA-pinned setup action", () 
 test("repo-only credential exists only in select and persisted checkout credentials are disabled", () => {
   assert.match(selectJob, /GH_TOKEN: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
   assert.match(selectJob, /token: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
-  assert.equal((selectJob.match(/SIFT_Q_READ_TOKEN/g) ?? []).length, 2);
+  assert.equal((selectJob.match(/SIFT_Q_READ_TOKEN/g) ?? []).length, 3);
   assert.doesNotMatch(
     publishJob,
     /SIFT_Q_READ_TOKEN|sift-q-refactor|actions\/checkout/,
@@ -123,6 +123,30 @@ test("repo-only credential exists only in select and persisted checkout credenti
     (selectJob.match(/persist-credentials: false/g) ?? []).length,
     2,
   );
+});
+
+test("selection fails closed unless the exact private publisher is disabled", () => {
+  const guardAt = selectJob.indexOf(
+    "name: require the legacy private publisher to be disabled",
+  );
+  const candidateFetchAt = selectJob.indexOf(
+    'gh api "repos/$SOURCE_REPO/actions/runs/$CANDIDATE_RUN_ID"',
+  );
+  const guardStep = selectJob.slice(
+    guardAt,
+    selectJob.indexOf(
+      "\n      - name: verify the private run and fetch its one exact artifact",
+    ),
+  );
+  assert.ok(guardAt > 0 && candidateFetchAt > guardAt);
+  assert.match(guardStep, /gh api "repos\/\$SOURCE_REPO"/);
+  assert.match(guardStep, /actions\/workflows\/publish-npm\.yml/);
+  assert.match(
+    guardStep,
+    /verify-exact-candidate\.mjs verify-legacy-publisher/,
+  );
+  assert.match(guardStep, /GH_TOKEN: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
+  assert.doesNotMatch(guardStep, /\|\| true|continue-on-error/);
 });
 
 test("candidate selection pins private run, repository, workflow, lineage, artifact ID and exact file set", () => {
