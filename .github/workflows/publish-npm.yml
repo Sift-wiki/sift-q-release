@@ -19,9 +19,13 @@ name: publish-npm
 #             canary and the guard. It has NO id-token permission, so nothing
 #             that runs here (dependency lifecycle scripts included) can mint
 #             an OIDC token.
-#   publish — downloads the exact tarball `build` proved, re-verifies the
-#             guard against a fresh checkout with `--ignore-scripts`, and
-#             publishes those bytes. It is the only job with id-token: write.
+#   publish — downloads the exact tarball `build` proved, re-runs the guard's
+#             exact-main / clean-tree / green-CI / green-gates checks against a
+#             fresh checkout, and publishes those bytes. It is the only job
+#             with id-token: write, and (R1, security re-verify 2026-08-20) it
+#             runs ZERO third-party code: no pnpm, no setup-node, no dependency
+#             install, no build — only the runner image's toolchain, npm
+#             itself, and the guard from the private checkout.
 #   The tarball crosses the job boundary sha256-pinned: what the canary ran is
 #   what the registry receives.
 #
@@ -42,11 +46,17 @@ name: publish-npm
 #   trusted-publisher record also names this environment; every field of that
 #   record (owner, repo, workflow filename, environment) must match exactly.
 #
-# What this lane does NOT change: the publish proof. prepublish-guard.mjs
-# runs UNCHANGED in both jobs and still demands: canonical origin URL, HEAD ==
-# origin/main after a live fetch, a clean tree, a green ci.yml run on main for
-# the SHA with a unique green "all gates passed" fan-in, and a green
-# release-gates.yml workflow_dispatch run for the SHA.
+# What this lane does NOT change: the publish proof. The build job runs
+# prepublish-guard.mjs UNCHANGED and IN FULL. The publish job re-runs, through
+# the guard's own exported functions, every check that gates the write:
+# canonical origin URL, HEAD == origin/main after a live fetch, a clean tree, a
+# green ci.yml run on main for the SHA with a unique green "all gates passed"
+# fan-in, and a green release-gates.yml workflow_dispatch run for the SHA. The
+# one check the publish job does not repeat is verifyFreshBundle (dist newer
+# than src), because satisfying it would require running the build — and its
+# node_modules — beside id-token: write; the build job already ran it against
+# the exact tarball being published (see the guard step below for the full
+# argument).
 #
 # What OIDC takes away: dist-tag promotion. "Trusted publishing only applies
 # to the npm publish command" (npm docs): the exchanged token cannot run
@@ -311,9 +321,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 20
-    # The ONLY job with id-token: write. It runs no dependency lifecycle
-    # scripts (--ignore-scripts below) and publishes a tarball it did not
-    # build, so nothing here can mint a token for anything but this publish.
+    # The ONLY job with id-token: write. R1: zero third-party code runs beside
+    # the OIDC token. No pnpm, no setup-node, no dependency install, no build;
+    # the only `uses:` are actions/checkout and actions/download-artifact, and
+    # the only code executed is the runner image's toolchain (node, git, gh),
+    # the exact pinned npm, and prepublish-guard.mjs from the fresh private
+    # checkout. This job publishes a tarball it did not build — the bytes are
+    # sha256-pinned to what the build job packed, canaried, and guarded.
     permissions:
       contents: read
       id-token: write
@@ -340,26 +354,18 @@ jobs:
           echo "build job proved: $BUILD_SHA"; echo "this checkout:    $HEAD"; echo "origin/main now:  $MAIN"
           test "$HEAD" = "$BUILD_SHA" && test "$MAIN" = "$BUILD_SHA" || { echo "refusing: main moved since the build job proved $BUILD_SHA; dispatch again."; exit 1; }
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-        with:
-          package_json_file: package.json
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-
       - name: install the exact npm
+        # No setup-node in this job (R1): the runner image's system Node runs
+        # everything here, and the guard needs only node: builtins plus git and
+        # gh, all part of the image. npm >= 11.5.1 is required for OIDC trusted
+        # publishing, so install the exact pinned npm and assert it. Run from
+        # RUNNER_TEMP so nothing in the checkout can intercept.
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
+          echo "system node: $(node --version)"
           npm install -g "npm@$NPM_VERSION"
           test "$(npm --version)" = "$NPM_VERSION" || { echo "refusing: npm $(npm --version) != $NPM_VERSION"; exit 1; }
-
-      # --ignore-scripts: no dependency lifecycle script runs in the job that
-      # holds id-token. The install exists only so `node build.mjs` can satisfy
-      # the guard's fresh-bundle check; the bytes published come from `build`.
-      - run: pnpm install --frozen-lockfile --ignore-scripts
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -380,13 +386,52 @@ jobs:
           echo "PUBLISH_TARBALL=$TARBALL" >>"$GITHUB_ENV"
 
       - name: prepublish guard (publish job, last before the write)
+        # Every guard check that gates the write re-runs here, through the
+        # guard's own exported functions: verifyExactMain (canonical origin,
+        # live fetch, HEAD == origin/main, clean tree), verifyGreenCi (green
+        # ci.yml with its unique "all gates passed" fan-in), and
+        # verifyGreenReleaseGates (green release-gates.yml dispatch). The ONE
+        # check deliberately not repeated is verifyFreshBundle (dist/main.js
+        # newer than src/): it exists to stop a stale local build being packed,
+        # and this job builds and packs nothing — the published bytes are the
+        # sha256-pinned tarball from `build`, which ran `node build.mjs &&
+        # node prepublish-guard.mjs`, the FULL guard, freshness included,
+        # against those exact bytes. Satisfying the freshness check here would
+        # require running build.mjs and an installed node_modules beside
+        # id-token: write, which is precisely what R1 removes. The runner
+        # script is written to RUNNER_TEMP, never into the checkout, so the
+        # guard's own clean-tree check still sees a pristine tree.
         working-directory: packages/sift-q
         env:
           GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
         run: |
           set -euo pipefail
-          node build.mjs
-          node prepublish-guard.mjs
+          cat >"$RUNNER_TEMP/run-guard.mjs" <<'GUARD'
+          import { execFileSync } from "node:child_process";
+          import { resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+          const { PublishGuardError, verifyExactMain, verifyGreenCi, verifyGreenReleaseGates } =
+            await import(pathToFileURL(resolve("prepublish-guard.mjs")));
+          const runGit = (args) =>
+            execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+          const runGh = (args) =>
+            execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+          try {
+            const sha = verifyExactMain(runGit);
+            const fanIn = verifyGreenCi(sha, runGh);
+            verifyGreenReleaseGates(sha, runGh);
+            console.error(
+              "publish guard (publish job): HEAD " + sha + " is exact current main with a clean " +
+              "tree; ci.yml and release-gates.yml are green (fan-in via " + fanIn + "). " +
+              "The freshness check ran in the build job against the exact tarball being published. OK.",
+            );
+          } catch (error) {
+            if (!(error instanceof PublishGuardError)) throw error;
+            console.error("\npublish refused: " + error.message + "\n");
+            process.exit(1);
+          }
+          GUARD
+          node "$RUNNER_TEMP/run-guard.mjs"
 
       - name: publish with OIDC trusted publishing
         # `npm publish <tarball>` (NOT pnpm publish: pnpm 11 regressed OIDC;

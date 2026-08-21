@@ -91,20 +91,59 @@ test('no npm credential, no registry-url, no corepack, provenance explicitly off
   assert.doesNotMatch(cfg, /--provenance(?!=false)/);
 });
 
-test('publish job installs with --ignore-scripts and publishes the sha256-verified tarball', () => {
-  assert.match(publishJob, /pnpm install --frozen-lockfile --ignore-scripts/);
+test('publish job publishes the sha256-verified tarball with --ignore-scripts', () => {
   assert.match(publishJob, /test "\$ACTUAL" = "\$EXPECTED_SHA256"/);
   assert.match(publishJob, /npm publish "\$PUBLISH_TARBALL" --ignore-scripts --access public --loglevel verbose/);
   assert.match(buildJob, /tarball_sha256=\$SHA256/);
 });
 
-test('the guard runs in both jobs, and in publish it is the last step before the write', () => {
-  assert.match(buildJob, /node prepublish-guard\.mjs/);
-  const guardAt = publishJob.indexOf('node prepublish-guard.mjs');
+test('the full guard runs in the build job; the publish job re-runs it last before the write', () => {
+  assert.match(buildJob, /node build\.mjs\n\s+node prepublish-guard\.mjs/);
+  const guardAt = publishJob.indexOf('node "$RUNNER_TEMP/run-guard.mjs"');
   const publishAt = publishJob.indexOf('npm publish "$PUBLISH_TARBALL"');
   assert.ok(guardAt > 0 && publishAt > guardAt, 'guard precedes the publish');
   const between = publishJob.slice(guardAt, publishAt);
   assert.equal((between.match(/\n      - name:/g) || []).length, 1, 'exactly one step (the publish) follows the guard');
+});
+
+// R1 (security re-verify 2026-08-20): zero third-party code executes in the
+// job that holds id-token: write. The publish job may run only the runner
+// image's own toolchain, the exact pinned npm, and the guard from the fresh
+// private checkout, against the sha256-pinned tarball the build job proved.
+test('R1: no pnpm, no setup-node, no cache, no build in the publish job', () => {
+  assert.doesNotMatch(publishJob, /pnpm/);
+  assert.doesNotMatch(publishJob, /action-setup|setup-node/);
+  assert.doesNotMatch(publishJob, /\bcache(?:-dependency-path)?:/);
+  assert.doesNotMatch(publishJob, /build\.mjs/);
+});
+
+test('R1: the only dependency the publish job installs is the pinned npm itself', () => {
+  const installs = [...publishJob.matchAll(/\b(?:npm|pnpm|yarn|corepack) (?:ci|install|add)\b[^\n]*/g)].map((m) => m[0]);
+  assert.deepEqual(installs, ['npm install -g "npm@$NPM_VERSION"']);
+});
+
+test('R1: the only actions in the publish job are SHA-pinned checkout and download-artifact', () => {
+  const uses = [...publishJob.matchAll(/uses: (\S+)/g)].map((m) => m[1]);
+  assert.deepEqual(
+    uses.map((u) => u.split('@')[0]),
+    ['actions/checkout', 'actions/download-artifact'],
+  );
+  for (const u of uses) {
+    assert.match(u.split('@')[1] ?? '', /^[0-9a-f]{40}$/, `${u} is not SHA-pinned`);
+  }
+});
+
+test('R1: the publish job re-runs every guard check except the build-job-only freshness check', () => {
+  // Pin the CALL SITES, not just the imported names: a runner script that
+  // imports a check but never invokes it must fail here.
+  assert.match(publishJob, /const sha = verifyExactMain\(runGit\);/);
+  assert.match(publishJob, /verifyGreenCi\(sha, runGh\)/);
+  assert.match(publishJob, /verifyGreenReleaseGates\(sha, runGh\);/);
+  assert.match(publishJob, /instanceof PublishGuardError/);
+  assert.doesNotMatch(publishJob, /runPublishGuard|verifyFreshBundle/);
+  // The runner script goes to RUNNER_TEMP, never into the checkout, so the
+  // guard's clean-tree check still passes.
+  assert.match(publishJob, /cat >"\$RUNNER_TEMP\/run-guard\.mjs"/);
 });
 
 test('publish refuses if main moved since build', () => {
