@@ -1,0 +1,213 @@
+name: verify-npm-stage-approval
+
+# This workflow never approves an npm stage. It verifies a post-stage owner
+# attestation from Nicholas or Charles and proves that `latest` serves the exact
+# bytes bound by the stage receipt. npm remains authoritative for the actual
+# interactive approver's audit identity.
+on:
+  workflow_dispatch:
+    inputs:
+      stage_run_id:
+        description: Successful stage-npm-latest workflow run ID.
+        type: string
+        required: true
+      stage_receipt_digest:
+        description: Exact sha256 digest of npm-stage-result.json.
+        type: string
+        required: true
+      signed_approval_attestation_base64:
+        description: Base64 of the short-lived signed approval attestation.
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  PACKAGE: "@sift-wiki/q"
+  NPM_VERSION: 11.19.0
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  NPM_CONFIG_USERCONFIG: /dev/null
+
+jobs:
+  verify:
+    name: verify human-approved npm stage
+    if: github.ref == 'refs/heads/main' && (github.actor == 'Unobtainiumrock' || github.actor == 'goodnight000')
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: refuse unless approval verification is switched on
+        env:
+          NPM_APPROVAL_VERIFICATION_LANE: ${{ vars.NPM_APPROVAL_VERIFICATION_LANE }}
+        run: |
+          set -euo pipefail
+          test "${NPM_APPROVAL_VERIFICATION_LANE:-}" = "signed-stage-approval-v1" || {
+            echo "refusing: npm approval verification lane is off"
+            exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: install the pinned npm verifier client
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/npm-pinned"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
+          echo "$prefix/bin" >>"$GITHUB_PATH"
+          test "$("$prefix/bin/npm" --version)" = "$NPM_VERSION"
+
+      - name: select the exact successful stage receipt
+        id: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE_RUN_ID: ${{ inputs.stage_run_id }}
+          STAGE_RECEIPT_DIGEST: ${{ inputs.stage_receipt_digest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$STAGE_RUN_ID" in ''|*[!0-9]*|0*) echo "refusing: invalid stage run"; exit 1;; esac
+          case "$STAGE_RECEIPT_DIGEST" in sha256:[0-9a-f][0-9a-f]*) ;; *) echo "refusing: invalid stage receipt digest"; exit 1;; esac
+          test "${#STAGE_RECEIPT_DIGEST}" -eq 71 || { echo "refusing: invalid stage receipt digest"; exit 1; }
+          BOUNDARY=$(mktemp -d "$RUNNER_TEMP/stage-approval.XXXXXX")
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGE_RUN_ID" >"$BOUNDARY/run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGE_RUN_ID/artifacts?per_page=100" >"$BOUNDARY/artifacts.json"
+          node --input-type=module - "$BOUNDARY/run.json" "$BOUNDARY/artifacts.json" "$STAGE_RUN_ID" "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$BOUNDARY/selection.json" <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const [runFile, artifactsFile, expectedRunId, expectedSha, expectedRepository, output] = process.argv.slice(2);
+          const run = JSON.parse(readFileSync(runFile, "utf8"));
+          const artifacts = JSON.parse(readFileSync(artifactsFile, "utf8"));
+          const refuse = (ok, message) => { if (!ok) throw new Error(`refusing: ${message}`); };
+          refuse(String(run.id) === expectedRunId, "stage run ID differs");
+          refuse(run.name === "stage-npm-latest", "stage workflow name differs");
+          refuse(run.path === ".github/workflows/stage-npm-latest.yml", "stage workflow path differs");
+          refuse(run.event === "workflow_dispatch", "stage workflow event differs");
+          refuse(run.head_branch === "main" && run.head_sha === expectedSha, "stage run is not exact current main");
+          refuse(run.status === "completed" && run.conclusion === "success", "stage run did not succeed");
+          refuse(run.repository?.full_name === expectedRepository, "stage repository differs");
+          refuse(Array.isArray(artifacts.artifacts), "stage artifacts response is invalid");
+          const matches = artifacts.artifacts.filter((artifact) =>
+            /^npm-stage-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(artifact.name ?? ""),
+          );
+          refuse(matches.length === 1, "expected exactly one stage result artifact");
+          const artifact = matches[0];
+          refuse(artifact.expired === false && artifact.size_in_bytes > 0, "stage result artifact is unavailable");
+          refuse(artifact.workflow_run?.id === run.id, "stage result artifact run differs");
+          refuse(
+            artifact.archive_download_url === `https://api.github.com/repos/${expectedRepository}/actions/artifacts/${artifact.id}/zip`,
+            "stage result artifact URL differs",
+          );
+          writeFileSync(output, `${JSON.stringify({ artifactId: artifact.id, artifactName: artifact.name, releaseSha: run.head_sha })}\n`, { flag: "wx" });
+          NODE
+          ARTIFACT_ID=$(node -p 'require(process.argv[1]).artifactId' "$BOUNDARY/selection.json")
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >"$BOUNDARY/stage-result.zip"
+          test "$(unzip -Z1 "$BOUNDARY/stage-result.zip")" = "npm-stage-result.json" || {
+            echo "refusing: stage result artifact file set differs"
+            exit 1
+          }
+          unzip -q "$BOUNDARY/stage-result.zip" -d "$BOUNDARY/receipt"
+          ACTUAL_DIGEST="sha256:$(sha256sum "$BOUNDARY/receipt/npm-stage-result.json" | cut -d' ' -f1)"
+          test "$ACTUAL_DIGEST" = "$STAGE_RECEIPT_DIGEST" || { echo "refusing: stage receipt digest differs"; exit 1; }
+          echo "boundary=$BOUNDARY" >>"$GITHUB_OUTPUT"
+
+      - name: verify signed approval and exact public registry bytes
+        id: approved
+        env:
+          APPROVAL_ATTESTATION_BASE64: ${{ inputs.signed_approval_attestation_base64 }}
+          BOUNDARY: ${{ steps.stage.outputs.boundary }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER_TRUST_POLICY_JSON: ${{ secrets.NPM_OWNER_TRUST_POLICY_JSON }}
+          STAGE_RECEIPT_DIGEST: ${{ inputs.stage_receipt_digest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${OWNER_TRUST_POLICY_JSON:-}" || { echo "refusing: owner trust policy missing"; exit 1; }
+          printf '%s' "$OWNER_TRUST_POLICY_JSON" >"$BOUNDARY/trust-policy.json"
+          printf '%s' "$APPROVAL_ATTESTATION_BASE64" | base64 --decode >"$BOUNDARY/approval-attestation.json" || {
+            echo "refusing: approval attestation is not valid base64"
+            exit 1
+          }
+          VERSION=$(node -p 'require(process.argv[1]).binding.version' "$BOUNDARY/receipt/npm-stage-result.json")
+          LATEST=$(npm view "$PACKAGE" dist-tags.latest) || { echo "refusing: cannot read latest"; exit 1; }
+          npm view "$PACKAGE@$VERSION" --json >"$BOUNDARY/registry-metadata.json" || {
+            echo "refusing: approved version is not public"
+            exit 1
+          }
+          TARBALL_URL=$(node --input-type=module - "$BOUNDARY/registry-metadata.json" "$VERSION" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          const version = process.argv[3];
+          const url = new URL(metadata.dist?.tarball ?? "");
+          const expectedPath = `/@sift-wiki/q/-/q-${version}.tgz`;
+          if (url.protocol !== "https:" || url.hostname !== "registry.npmjs.org" || url.pathname !== expectedPath || url.username || url.password || url.search || url.hash) {
+            throw new Error("refusing: registry tarball URL is not canonical");
+          }
+          process.stdout.write(url.href);
+          NODE
+          )
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            "$TARBALL_URL" --output "$BOUNDARY/registry-package.tgz"
+          RESULT=$(node scripts/stage-npm-latest.mjs verify-approval \
+            --stage-receipt "$BOUNDARY/receipt/npm-stage-result.json" \
+            --stage-receipt-digest "$STAGE_RECEIPT_DIGEST" \
+            --approval-attestation "$BOUNDARY/approval-attestation.json" \
+            --trust-policy "$BOUNDARY/trust-policy.json" \
+            --registry-metadata "$BOUNDARY/registry-metadata.json" \
+            --registry-tarball "$BOUNDARY/registry-package.tgz" \
+            --current-latest "$LATEST" --actor "$GITHUB_ACTOR" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --release-sha "$GITHUB_SHA" --output "$BOUNDARY/npm-approval-result.json")
+          APPROVAL_ID=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).approvalId)' "$RESULT")
+          RECEIPT_DIGEST=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).receiptDigest)' "$RESULT")
+          REPLAY_NAME="npm-stage-approval-$APPROVAL_ID"
+          test "$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq ".artifacts[]|select(.name==\"$REPLAY_NAME\")|.id" | wc -l)" -eq 0 || {
+            echo "refusing: signed approval attestation was already consumed"
+            exit 1
+          }
+          APPROVED_BY=$(node -p 'require(process.argv[1]).approval.approvedBy' "$BOUNDARY/npm-approval-result.json")
+          mkdir -p "$RUNNER_TEMP/approval-result"
+          cp "$BOUNDARY/npm-approval-result.json" "$RUNNER_TEMP/approval-result/"
+          echo "approval_id=$APPROVAL_ID" >>"$GITHUB_OUTPUT"
+          echo "approved_by=$APPROVED_BY" >>"$GITHUB_OUTPUT"
+          echo "artifact_name=$REPLAY_NAME" >>"$GITHUB_OUTPUT"
+          echo "receipt_digest=$RECEIPT_DIGEST" >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.approved.outputs.artifact_name }}
+          path: ${{ runner.temp }}/approval-result/npm-approval-result.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: record verified npm release
+        env:
+          RECEIPT_DIGEST: ${{ steps.approved.outputs.receipt_digest }}
+          APPROVED_BY: ${{ steps.approved.outputs.approved_by }}
+          VERSION: ${{ steps.approved.outputs.version }}
+        run: |
+          {
+            echo "## approved stage verified"
+            echo
+            echo "- package: $PACKAGE@$VERSION"
+            echo "- latest: $VERSION"
+            echo "- result receipt: $RECEIPT_DIGEST"
+            echo "- owner attestation: $APPROVED_BY reports completing npm's interactive 2FA approval"
+            echo "- verified: registry metadata and tarball bytes match the signed stage receipt"
+            echo "- npm remains authoritative for the actual approver identity in its audit record"
+          } >>"$GITHUB_STEP_SUMMARY"

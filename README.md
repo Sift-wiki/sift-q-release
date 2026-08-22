@@ -16,33 +16,41 @@ repository's GitHub-hosted jobs are unavailable.
    the clean-HOME npm canary, and uploads exactly three files: the tarball and
    two signed receipts.
 2. A maintainer records that successful run ID and the signed candidate's
-   `sha256:...` receipt digest, then dispatches `publish-npm` here with those
-   exact inputs and `dry_run=true`.
+   `sha256:...` receipt digest, creates a short-lived signed stage
+   authorization for the exact candidate, and dispatches `stage-npm-latest`
+   here with those exact inputs.
 3. The no-OIDC selection job uses a fine-grained read-only token to verify the
    private repository ID, workflow path, accepted-main lineage, run result,
    artifact identity, exact file set, Ed25519 signatures, source/tree/receipt
    digests, runtime-canary receipt, tarball digest, and package metadata. It
-   does not install, build, pack, or execute candidate code.
-4. The maintainer dispatches again with the same run ID and receipt digest and
-   `dry_run=false`. The OIDC job receives only the verified tarball, rechecks
-   its digest and registry absence, and publishes those exact bytes under the
-   `next` dist-tag. It has no private-repository credential or private checkout.
-5. A separate no-OIDC, no-secret, no-write job fetches that exact version back through the canonical npm
-   registry, proves the registry tarball is byte-identical to the selected
-   candidate, installs those registry-served bytes under a fresh temporary
-   HOME, runs the bounded CLI canary, re-reads `next` and `latest`, proves
-   neither moved unexpectedly, and emits
-   `npm-next-transition.json` plus `npm-latest-promotion-binding.json`.
-6. Those two files are strict, machine-readable evidence, but they are
-   explicitly marked unsigned and non-authoritative. A separately governed
-   promotion lane must verify an owner-trusted, short-lived signed authorization
-   containing exactly the emitted promotion binding before it may move `next`
-   to `latest`.
-   No trusted promotion signer or receipt-verification policy is configured in
-   this repository yet, so that final lane remains fail-closed.
-7. Rollback is roll-forward: npm versions are immutable. Before promotion, a
-   bad candidate can be abandoned on `next`; after promotion, it is followed by
-   a fixed patch.
+   does not install, build, pack, or execute candidate code. Its public
+   handoff contains only authenticated ciphertext. Before uploading that
+   ciphertext, it proves the configured RSA public key's SPKI fingerprint is
+   bound into the short-lived owner-signed stage authorization.
+4. Production proves the RSA private key derives that same signed SPKI before
+   decrypting and validating the candidate, then repeats the proof before publishing another
+   ciphertext-only command artifact. The OIDC job decrypts it in ephemeral
+   storage only after independently deriving the private key's public SPKI and
+   comparing it with the verified signed fingerprint; the command contains the verified tarball, signed authority,
+   verifier and its complete module closure, and exact-byte manifest. It
+   rechecks current `main`, authorization lifetime, replay state, registry
+   absence, and every command byte, then runs exactly one mutation:
+   `npm stage publish npm-package.tgz --tag latest --ignore-scripts --access public --json`.
+   It has no private-repository credential or checkout and cannot approve the
+   stage.
+5. The workflow records the npm stage ID and exact package digests in a
+   nonsecret receipt. Nicholas or Charles reviews the staged package and
+   approves it interactively in npmjs.com or with `npm stage approve <stage-id>`;
+   npm requires their 2FA for that action.
+6. After approval, an owner supplies a separate short-lived signed approval
+   attestation and dispatches `verify-npm-stage-approval`. That read-only
+   workflow fetches the exact stage receipt, public metadata, and canonical
+   registry tarball; proves `latest` and every published byte match; and emits
+   a separate approval result receipt. See
+   [`docs/npm-staged-release.md`](docs/npm-staged-release.md).
+7. Rollback is roll-forward: npm versions are immutable. Before approval, a bad
+   stage is rejected or allowed to expire; after approval, it is followed by a
+   fixed patch.
 
 The package ships **without a provenance attestation**. npm would generate
 one automatically for an OIDC publish from this public repository, but it
@@ -74,15 +82,19 @@ the workflow it holds:
   `disabled_manually`; (2) create `candidate-selection`, require a reviewer, forbid
   self-review and admin bypass, allow only `main`, and add only
   `CANDIDATE_SELECTION_LANE=exact-development-candidate`, `SIFT_Q_READ_TOKEN`, and
-  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`; (3) remove `SIFT_Q_READ_TOKEN` from
+  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`, the public owner trust policy, plus
+  the public transfer key whose DER-SPKI SHA-256 is bound into each signed stage
+  authorization; (3) remove `SIFT_Q_READ_TOKEN` from
   `production`; and (4) run the first reviewed dry run. `production` must retain its
   reviewer and main-only protections and only
-  `NPM_PUBLISHER_LANE=github-actions-oidc`; the npm OIDC job must not receive either
-  private-source secret. Every selection rechecks the exact private repository and legacy
+  `NPM_STAGING_LANE=oidc-stage-latest-v1`,
+  `NPM_APPROVAL_VERIFICATION_LANE=signed-stage-approval-v1`, the owner trust policy,
+  and the stage-transfer keypair;
+  the npm OIDC job must not receive either private-source secret. Every selection rechecks the exact private repository and legacy
   workflow IDs, name, path, and `disabled_manually` state before it reads candidate bytes.
 - `tests/publish-npm-workflow.test.mjs` pins the workflow boundary: dispatch-only exact
   identifiers, `id-token` only on the publisher, no source credential in that job,
-  SHA-pinned actions, exact npm, exact tarball transfer, publish-to-`next`, canonical
+  SHA-pinned actions, exact npm, exact tarball transfer, historical publish-to-`next`, canonical
   registry byte equality, no direct `latest` mutation, provenance off, and kill switch
   first. `tests/verify-exact-candidate.test.mjs` adversarially substitutes repository,
   workflow, event, branch, conclusion, lineage, artifact authority, file set, and file type.
@@ -92,39 +104,30 @@ the workflow it holds:
   Relay CI runs both suites on every pull request.
 - Each authority has its own kill switch. `candidate-selection` requires
   `CANDIDATE_SELECTION_LANE=exact-development-candidate`; `production` requires
-  `NPM_PUBLISHER_LANE=github-actions-oidc`. Environment admins can stop either boundary
-  without a workflow edit.
+  `NPM_STAGING_LANE=oidc-stage-latest-v1` and
+  `NPM_APPROVAL_VERIFICATION_LANE=signed-stage-approval-v1`. Environment admins can stop
+  either boundary without a workflow edit.
 
-## Latest promotion interface
+## Staged latest interface
 
-`publish-npm` never invokes `npm dist-tag` and never publishes with `--tag latest`.
-Its evidence artifact contains:
+Trusted publishing does not authenticate `npm dist-tag add`; OIDC supports
+`npm publish` and `npm stage publish`. npm also shares one immutable version
+index between staged and published packages, so a version already published to
+`next` cannot later be staged. Future releases therefore stage the exact
+development-qualified candidate directly with the intended immutable tag
+`latest` and never publish that version to `next` first.
 
-- `npm-next-transition.json`: exact source, candidate receipt, tarball digest,
-  canonical registry metadata, unchanged `latest`, and clean canary result.
-- `npm-latest-promotion-binding.json`: the exact payload a later signed
-  promotion receipt must bind, including the transition-evidence digest,
-  source/tree SHAs, candidate receipt digest, tarball digest, version, and
-  `next` → `latest` transition, including the expected current values of both
-  tags.
+The existing `publish-npm` implementation and its transition evidence remain
+available as reviewed historical work, but its live mutation path must stay
+disabled. It is not the activation path for future versions. Versions already
+published to `next` are outside this automated lane and require an explicit,
+separately reviewed owner decision.
 
-The binding is unsigned by design. `scripts/verify-registry-transition.mjs
-verify-promotion-binding` checks that it is the exact deterministic projection
-of the transition evidence; it does **not** authenticate an operator.
-`verify-promotion-receipt` is the consumer interface for the future lane: it
-requires an Ed25519 `sift-q-npm-latest-promotion-receipt/v1`, verifies its
-entire schema, algorithm, key identity, unique authorization ID, bounded
-authorization window, and exact binding against a separately supplied
-`sift-q-npm-latest-promotion-trust/v1` policy, and then requires the signed
-binding to equal the deterministic projection. It also refuses unless the
-live `latest` and `next` values equal the signed preconditions; serialization
-means the first successful promotion changes `latest` and makes replay fail.
-No production trust policy,
-private key, or made-up receipt is stored here. The future promotion lane must
-also re-read `next`, its exact-version registry bytes, and current `latest`
-under the production lock, record the authorization ID as consumed, and only
-then perform the separately authorized `next` → `latest` change. Until an
-owner-managed signer and trust policy exist, promotion is blocked.
+No production signing key or npm credential is stored here. The only npm
+mutation uses GitHub OIDC; stage approval is an interactive npm 2FA act by
+Nicholas or Charles. Both operations are bound together afterward by a signed
+approval attestation and an independently generated registry-verification
+receipt.
 
 ## Break glass
 

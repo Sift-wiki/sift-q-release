@@ -1,0 +1,523 @@
+name: stage-npm-latest
+
+# Tokenless release lane: consume one exact, signed, development-qualified
+# candidate and stage those bytes with the immutable intended tag `latest`.
+# This workflow never approves a stage. Nicholas or Charles must review it and
+# approve interactively with npm 2FA, followed by verify-npm-stage-approval.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful private deploy-development run ID.
+        type: string
+        required: true
+      candidate_receipt_digest:
+        description: Exact sha256 digest of signed-development-candidate.json.
+        type: string
+        required: true
+      expected_version:
+        description: Exact stable x.y.z version in the candidate.
+        type: string
+        required: true
+      signed_authorization_base64:
+        description: Base64 of the short-lived signed stage authorization.
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  PACKAGE: "@sift-wiki/q"
+  SOURCE_REPO: Sift-wiki/sift-q-refactor
+  NPM_VERSION: 11.19.0
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  NPM_CONFIG_USERCONFIG: /dev/null
+
+jobs:
+  select:
+    name: select exact signed private candidate
+    if: github.ref == 'refs/heads/main' && (github.actor == 'Unobtainiumrock' || github.actor == 'goodnight000')
+    runs-on: ubuntu-latest
+    environment: candidate-selection
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - name: refuse unless exact candidate selection is switched on
+        env:
+          CANDIDATE_SELECTION_LANE: ${{ vars.CANDIDATE_SELECTION_LANE }}
+        run: |
+          set -euo pipefail
+          test "${CANDIDATE_SELECTION_LANE:-}" = "exact-development-candidate" || {
+            echo "refusing: candidate selection lane is off"
+            exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: release
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: require the legacy private publisher to remain disabled
+        env:
+          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          BOUNDARY=$(mktemp -d "$RUNNER_TEMP/stage-selection.XXXXXX")
+          gh api "repos/$SOURCE_REPO" >"$BOUNDARY/source-repository.json"
+          gh api "repos/$SOURCE_REPO/actions/workflows/publish-npm.yml" >"$BOUNDARY/legacy-workflow.json"
+          node release/scripts/verify-exact-candidate.mjs verify-legacy-publisher \
+            --repository "$BOUNDARY/source-repository.json" \
+            --workflow "$BOUNDARY/legacy-workflow.json"
+
+      - name: fetch the exact private candidate run and artifact
+        id: private_run
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ secrets.SIFT_Q_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$CANDIDATE_RUN_ID" in ''|*[!0-9]*|0*) echo "refusing: invalid candidate run"; exit 1;; esac
+          BOUNDARY=$(mktemp -d "$RUNNER_TEMP/stage-candidate.XXXXXX")
+          gh api "repos/$SOURCE_REPO/actions/runs/$CANDIDATE_RUN_ID" >"$BOUNDARY/run.json"
+          CANDIDATE_SHA=$(node -p 'require(process.argv[1]).head_sha' "$BOUNDARY/run.json")
+          gh api "repos/$SOURCE_REPO/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" >"$BOUNDARY/artifacts.json"
+          gh api "repos/$SOURCE_REPO/commits/$CANDIDATE_SHA" >"$BOUNDARY/candidate-commit.json"
+          gh api "repos/$SOURCE_REPO/git/ref/heads/main" >"$BOUNDARY/current-main.json"
+          gh api "repos/$SOURCE_REPO/compare/$CANDIDATE_SHA...main" >"$BOUNDARY/comparison.json"
+          node release/scripts/verify-exact-candidate.mjs select-run \
+            --run "$BOUNDARY/run.json" --artifacts "$BOUNDARY/artifacts.json" \
+            --candidate-commit "$BOUNDARY/candidate-commit.json" \
+            --current-main "$BOUNDARY/current-main.json" --comparison "$BOUNDARY/comparison.json" \
+            --run-id "$CANDIDATE_RUN_ID" --output "$BOUNDARY/selection.json"
+          ARTIFACT_ID=$(node -p 'require(process.argv[1]).artifactId' "$BOUNDARY/selection.json")
+          gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID/zip" >"$BOUNDARY/candidate.zip"
+          EXPECTED=$(printf '%s\n' npm-package.tgz signed-development-candidate.json signed-npm-runtime-canary.json | sort)
+          test "$(unzip -Z1 "$BOUNDARY/candidate.zip" | sort)" = "$EXPECTED" || {
+            echo "refusing: private candidate artifact file set differs"
+            exit 1
+          }
+          CANDIDATE=$(mktemp -d "$RUNNER_TEMP/selected-candidate.XXXXXX")
+          unzip -q "$BOUNDARY/candidate.zip" -d "$CANDIDATE"
+          echo "boundary=$BOUNDARY" >>"$GITHUB_OUTPUT"
+          echo "candidate=$CANDIDATE" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Sift-wiki/sift-q-refactor
+          token: ${{ secrets.SIFT_Q_READ_TOKEN }}
+          ref: main
+          path: source
+          persist-credentials: false
+
+      - name: verify signed receipts, source tree, runtime canary, and exact tarball
+        id: candidate
+        env:
+          AUTHORIZATION_BASE64: ${{ inputs.signed_authorization_base64 }}
+          CANDIDATE: ${{ steps.private_run.outputs.candidate }}
+          CANDIDATE_RECEIPT_DIGEST: ${{ inputs.candidate_receipt_digest }}
+          CANDIDATE_TRUST_POLICY_JSON: ${{ secrets.DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          OWNER_TRUST_POLICY_JSON: ${{ secrets.NPM_OWNER_TRUST_POLICY_JSON }}
+          PRIVATE_BOUNDARY: ${{ steps.private_run.outputs.boundary }}
+          TRANSFER_PUBLIC_KEY_PEM: ${{ vars.NPM_STAGE_TRANSFER_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${CANDIDATE_TRUST_POLICY_JSON:-}" || { echo "refusing: candidate trust policy missing"; exit 1; }
+          test -n "${OWNER_TRUST_POLICY_JSON:-}" || { echo "refusing: owner trust policy missing"; exit 1; }
+          CURRENT_MAIN=$(node -p 'require(process.argv[1]).currentMainSha' "$PRIVATE_BOUNDARY/selection.json")
+          test "$(git -C source rev-parse HEAD)" = "$CURRENT_MAIN" || { echo "refusing: private main moved"; exit 1; }
+          printf '%s' "$CANDIDATE_TRUST_POLICY_JSON" >"$PRIVATE_BOUNDARY/trust-policy.json"
+          node release/scripts/verify-exact-candidate.mjs verify-candidate \
+            --source-root source --candidate-directory "$CANDIDATE" \
+            --trust-policy "$PRIVATE_BOUNDARY/trust-policy.json" \
+            --selection "$PRIVATE_BOUNDARY/selection.json" \
+            --receipt-digest "$CANDIDATE_RECEIPT_DIGEST" \
+            --expected-version "$EXPECTED_VERSION" \
+            --output "$PRIVATE_BOUNDARY/verified-candidate.json"
+          VERSION=$(node -p 'require(process.argv[1]).version' "$PRIVATE_BOUNDARY/verified-candidate.json")
+          test -n "${TRANSFER_PUBLIC_KEY_PEM:-}" || { echo "refusing: transfer public key missing"; exit 1; }
+          PLAINTEXT=$(mktemp -d "$RUNNER_TEMP/stage-plaintext.XXXXXX")
+          cp "$CANDIDATE/npm-package.tgz" "$PLAINTEXT/npm-package.tgz"
+          cp "$PRIVATE_BOUNDARY/verified-candidate.json" "$PLAINTEXT/verified-candidate.json"
+          CIPHERTEXT=$(mktemp -d "$RUNNER_TEMP/stage-ciphertext.XXXXXX")
+          printf '%s' "$TRANSFER_PUBLIC_KEY_PEM" >"$PRIVATE_BOUNDARY/transfer-public.pem"
+          printf '%s' "$AUTHORIZATION_BASE64" | base64 --decode >"$PRIVATE_BOUNDARY/authorization.json" || {
+            echo "refusing: stage authorization is not valid base64"
+            exit 1
+          }
+          printf '%s' "$OWNER_TRUST_POLICY_JSON" >"$PRIVATE_BOUNDARY/owner-trust-policy.json"
+          node release/scripts/stage-npm-latest.mjs verify-transfer-recipient \
+            --authorization "$PRIVATE_BOUNDARY/authorization.json" \
+            --trust-policy "$PRIVATE_BOUNDARY/owner-trust-policy.json" \
+            --public-key "$PRIVATE_BOUNDARY/transfer-public.pem"
+          node release/scripts/seal-stage-transfer.mjs seal \
+            --directory "$PLAINTEXT" --expected-files npm-package.tgz,verified-candidate.json \
+            --public-key "$PRIVATE_BOUNDARY/transfer-public.pem" \
+            --output "$CIPHERTEXT/stage-candidate.envelope.json"
+          echo "ciphertext=$CIPHERTEXT/stage-candidate.envelope.json" >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: selected-stage-candidate
+          path: ${{ steps.candidate.outputs.ciphertext }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  authorize:
+    name: consume signed owner stage authority
+    needs: select
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      authorization_id: ${{ steps.freeze.outputs.authorization_id }}
+      command_artifact: ${{ steps.freeze.outputs.command_artifact }}
+      command_manifest_digest: ${{ steps.freeze.outputs.command_manifest_digest }}
+      transfer_spki_sha256: ${{ steps.freeze.outputs.transfer_spki_sha256 }}
+      version: ${{ steps.freeze.outputs.version }}
+    steps:
+      - name: refuse unless tokenless staging is switched on
+        env:
+          NPM_STAGING_LANE: ${{ vars.NPM_STAGING_LANE }}
+        run: |
+          set -euo pipefail
+          test "${NPM_STAGING_LANE:-}" = "oidc-stage-latest-v1" || {
+            echo "refusing: production npm staging lane is off"
+            exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: release
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: selected-stage-candidate
+          path: ${{ runner.temp }}/selected-stage-candidate-ciphertext
+
+      - name: decrypt the candidate only inside production
+        env:
+          AUTHORIZATION_BASE64: ${{ inputs.signed_authorization_base64 }}
+          OWNER_TRUST_POLICY_JSON: ${{ secrets.NPM_OWNER_TRUST_POLICY_JSON }}
+          TRANSFER_PRIVATE_KEY_PEM: ${{ secrets.NPM_STAGE_TRANSFER_PRIVATE_KEY_PEM }}
+          TRANSFER_PUBLIC_KEY_PEM: ${{ vars.NPM_STAGE_TRANSFER_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${TRANSFER_PRIVATE_KEY_PEM:-}" || { echo "refusing: transfer private key missing"; exit 1; }
+          test -n "${TRANSFER_PUBLIC_KEY_PEM:-}" || { echo "refusing: transfer public key missing"; exit 1; }
+          test -n "${OWNER_TRUST_POLICY_JSON:-}" || { echo "refusing: owner trust policy missing"; exit 1; }
+          KEY=$(mktemp "$RUNNER_TEMP/stage-transfer-private.XXXXXX")
+          PUBLIC_KEY=$(mktemp "$RUNNER_TEMP/stage-transfer-public.XXXXXX")
+          AUTHORIZATION=$(mktemp "$RUNNER_TEMP/stage-authorization.XXXXXX")
+          TRUST_POLICY=$(mktemp "$RUNNER_TEMP/stage-owner-trust.XXXXXX")
+          printf '%s' "$TRANSFER_PRIVATE_KEY_PEM" >"$KEY"
+          printf '%s' "$TRANSFER_PUBLIC_KEY_PEM" >"$PUBLIC_KEY"
+          printf '%s' "$AUTHORIZATION_BASE64" | base64 --decode >"$AUTHORIZATION" || {
+            echo "refusing: stage authorization is not valid base64"
+            exit 1
+          }
+          printf '%s' "$OWNER_TRUST_POLICY_JSON" >"$TRUST_POLICY"
+          node release/scripts/stage-npm-latest.mjs verify-transfer-recipient \
+            --authorization "$AUTHORIZATION" --trust-policy "$TRUST_POLICY" \
+            --public-key "$PUBLIC_KEY" --private-key "$KEY"
+          node release/scripts/seal-stage-transfer.mjs open \
+            --envelope "$RUNNER_TEMP/selected-stage-candidate-ciphertext/stage-candidate.envelope.json" \
+            --expected-files npm-package.tgz,verified-candidate.json --private-key "$KEY" \
+            --directory "$RUNNER_TEMP/selected-stage-candidate"
+
+      - name: verify live registry preconditions and freeze one stage command
+        id: freeze
+        env:
+          AUTHORIZATION_BASE64: ${{ inputs.signed_authorization_base64 }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER_TRUST_POLICY_JSON: ${{ secrets.NPM_OWNER_TRUST_POLICY_JSON }}
+          TRANSFER_PRIVATE_KEY_PEM: ${{ secrets.NPM_STAGE_TRANSFER_PRIVATE_KEY_PEM }}
+          TRANSFER_PUBLIC_KEY_PEM: ${{ vars.NPM_STAGE_TRANSFER_PUBLIC_KEY_PEM }}
+          VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git -C release rev-parse HEAD)" = "$GITHUB_SHA" || { echo "refusing: release checkout differs"; exit 1; }
+          test -n "${OWNER_TRUST_POLICY_JSON:-}" || { echo "refusing: owner trust policy missing"; exit 1; }
+          AUTH_DIR=$(mktemp -d "$RUNNER_TEMP/stage-authority.XXXXXX")
+          printf '%s' "$AUTHORIZATION_BASE64" | base64 --decode >"$AUTH_DIR/authorization.json" || {
+            echo "refusing: stage authorization is not valid base64"
+            exit 1
+          }
+          printf '%s' "$OWNER_TRUST_POLICY_JSON" >"$AUTH_DIR/trust-policy.json"
+          test -n "${TRANSFER_PUBLIC_KEY_PEM:-}" || { echo "refusing: transfer public key missing"; exit 1; }
+          test -n "${TRANSFER_PRIVATE_KEY_PEM:-}" || { echo "refusing: transfer private key missing"; exit 1; }
+          printf '%s' "$TRANSFER_PUBLIC_KEY_PEM" >"$AUTH_DIR/transfer-public.pem"
+          printf '%s' "$TRANSFER_PRIVATE_KEY_PEM" >"$AUTH_DIR/transfer-private.pem"
+          RECIPIENT=$(node release/scripts/stage-npm-latest.mjs verify-transfer-recipient \
+            --authorization "$AUTH_DIR/authorization.json" --trust-policy "$AUTH_DIR/trust-policy.json" \
+            --public-key "$AUTH_DIR/transfer-public.pem" --private-key "$AUTH_DIR/transfer-private.pem")
+          TRANSFER_SPKI_SHA256=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).transferPublicKeySpkiSha256)' "$RECIPIENT")
+          LATEST=$(npm view "$PACKAGE" dist-tags.latest) || { echo "refusing: cannot read latest"; exit 1; }
+          VERSIONS=$(npm view "$PACKAGE" versions --json) || { echo "refusing: cannot read versions"; exit 1; }
+          ABSENT=$(node -e '
+            let v=JSON.parse(process.argv[2]); if(typeof v==="string")v=[v];
+            if(!Array.isArray(v)||v.length===0)process.exit(2);
+            process.stdout.write(v.includes(process.argv[1])?"false":"true");
+          ' "$VERSION" "$VERSIONS") || { echo "refusing: registry versions are invalid"; exit 1; }
+          COMMAND=$(mktemp -d "$RUNNER_TEMP/npm-stage-command.XXXXXX")
+          mkdir -p "$COMMAND/scripts"
+          cp "$AUTH_DIR/authorization.json" "$COMMAND/authorization.json"
+          cp "$AUTH_DIR/trust-policy.json" "$COMMAND/trust-policy.json"
+          cp "$RUNNER_TEMP/selected-stage-candidate/npm-package.tgz" "$COMMAND/npm-package.tgz"
+          cp "$RUNNER_TEMP/selected-stage-candidate/verified-candidate.json" "$COMMAND/selected-candidate.json"
+          cp release/scripts/stage-npm-latest.mjs "$COMMAND/scripts/stage-npm-latest.mjs"
+          cp release/scripts/verify-exact-candidate.mjs "$COMMAND/scripts/verify-exact-candidate.mjs"
+          cp release/scripts/verify-registry-transition.mjs "$COMMAND/scripts/verify-registry-transition.mjs"
+          PREPARED=$(node release/scripts/stage-npm-latest.mjs prepare \
+            --authorization "$COMMAND/authorization.json" --trust-policy "$COMMAND/trust-policy.json" \
+            --selected-candidate "$COMMAND/selected-candidate.json" --tarball "$COMMAND/npm-package.tgz" \
+            --transfer-public-key "$AUTH_DIR/transfer-public.pem" \
+            --release-sha "$GITHUB_SHA" --current-latest "$LATEST" --version-is-absent "$ABSENT" \
+            --output "$COMMAND/plan.json")
+          AUTHORIZATION_ID=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).authorizationId)' "$PREPARED")
+          REPLAY_NAME="npm-stage-authorization-$AUTHORIZATION_ID"
+          test "$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq ".artifacts[]|select(.name==\"$REPLAY_NAME\")|.id" | wc -l)" -eq 0 || {
+            echo "refusing: stage authorization was already consumed"
+            exit 1
+          }
+          MANIFEST=$(node release/scripts/stage-npm-latest.mjs create-command-manifest \
+            --directory "$COMMAND" --output "$COMMAND/command-manifest.json")
+          CIPHERTEXT=$(mktemp -d "$RUNNER_TEMP/stage-command-ciphertext.XXXXXX")
+          node release/scripts/seal-stage-transfer.mjs seal \
+            --directory "$COMMAND" \
+            --expected-files authorization.json,command-manifest.json,npm-package.tgz,plan.json,scripts/stage-npm-latest.mjs,scripts/verify-exact-candidate.mjs,scripts/verify-registry-transition.mjs,selected-candidate.json,trust-policy.json \
+            --public-key "$AUTH_DIR/transfer-public.pem" \
+            --output "$CIPHERTEXT/stage-command.envelope.json"
+          echo "authorization_id=$AUTHORIZATION_ID" >>"$GITHUB_OUTPUT"
+          echo "command_artifact=$REPLAY_NAME" >>"$GITHUB_OUTPUT"
+          echo "command_ciphertext=$CIPHERTEXT/stage-command.envelope.json" >>"$GITHUB_OUTPUT"
+          echo "command_manifest_digest=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).manifestDigest)' "$MANIFEST")" >>"$GITHUB_OUTPUT"
+          echo "transfer_spki_sha256=$TRANSFER_SPKI_SHA256" >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.freeze.outputs.command_artifact }}
+          path: ${{ steps.freeze.outputs.command_ciphertext }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  stage:
+    name: stage exact bytes under immutable latest intent
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      NPM_CONFIG_PROVENANCE: "false"
+    steps:
+      - name: refuse unless tokenless staging remains switched on
+        env:
+          NPM_STAGING_LANE: ${{ vars.NPM_STAGING_LANE }}
+        run: |
+          set -euo pipefail
+          test "${NPM_STAGING_LANE:-}" = "oidc-stage-latest-v1" || { echo "refusing: staging lane is off"; exit 1; }
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: install exact npm OIDC client
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/npm-pinned"
+          npm install -g --prefix "$prefix" --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
+          echo "$prefix/bin" >>"$GITHUB_PATH"
+          test "$("$prefix/bin/npm" --version)" = "$NPM_VERSION"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.authorize.outputs.command_artifact }}
+          path: ${{ runner.temp }}/stage-command-ciphertext
+
+      - name: decrypt the exact command only inside production
+        env:
+          EXPECTED_TRANSFER_SPKI_SHA256: ${{ needs.authorize.outputs.transfer_spki_sha256 }}
+          TRANSFER_PRIVATE_KEY_PEM: ${{ secrets.NPM_STAGE_TRANSFER_PRIVATE_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${TRANSFER_PRIVATE_KEY_PEM:-}" || { echo "refusing: transfer private key missing"; exit 1; }
+          printf '%s' "$TRANSFER_PRIVATE_KEY_PEM" >"$RUNNER_TEMP/stage-transfer-private.pem"
+          node --input-type=module - \
+            "$RUNNER_TEMP/stage-command-ciphertext/stage-command.envelope.json" \
+            "$RUNNER_TEMP/stage-transfer-private.pem" "$RUNNER_TEMP/stage-command" <<'NODE'
+          import { constants, createDecipheriv, createHash, createPrivateKey, createPublicKey, privateDecrypt } from "node:crypto";
+          import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+          import { dirname, join } from "node:path";
+          const [envelopeFile, keyFile, output] = process.argv.slice(2);
+          const schema = "sift-q-sealed-stage-transfer/v1";
+          const expected = ["authorization.json", "command-manifest.json", "npm-package.tgz", "plan.json", "scripts/stage-npm-latest.mjs", "scripts/verify-exact-candidate.mjs", "scripts/verify-registry-transition.mjs", "selected-candidate.json", "trust-policy.json"];
+          const envelope = JSON.parse(readFileSync(envelopeFile, "utf8"));
+          const keys = Object.keys(envelope).sort();
+          if (JSON.stringify(keys) !== JSON.stringify(["algorithm", "authenticationTag", "ciphertext", "encryptedKey", "iv", "schemaVersion"]) || envelope.schemaVersion !== schema || envelope.algorithm !== "RSA-OAEP-3072+/SHA-256+AES-256-GCM") throw new Error("refusing: sealed command identity differs");
+          const privateKey = createPrivateKey(readFileSync(keyFile, "utf8"));
+          if (privateKey.asymmetricKeyType !== "rsa" || (privateKey.asymmetricKeyDetails?.modulusLength ?? 0) < 3072) throw new Error("refusing: transfer private key differs");
+          const expectedFingerprint = process.env.EXPECTED_TRANSFER_SPKI_SHA256;
+          if (!/^sha256:[0-9a-f]{64}$/.test(expectedFingerprint ?? "")) throw new Error("refusing: signed transfer SPKI fingerprint is invalid");
+          const observedFingerprint = `sha256:${createHash("sha256").update(createPublicKey(privateKey).export({ format: "der", type: "spki" })).digest("hex")}`;
+          if (observedFingerprint !== expectedFingerprint) throw new Error("refusing: transfer private key differs from signed stage authority");
+          const contentKey = privateDecrypt({ key: privateKey, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha256", oaepLabel: Buffer.from(schema) }, Buffer.from(envelope.encryptedKey, "base64"));
+          const decipher = createDecipheriv("aes-256-gcm", contentKey, Buffer.from(envelope.iv, "base64"));
+          decipher.setAAD(Buffer.from(schema));
+          decipher.setAuthTag(Buffer.from(envelope.authenticationTag, "base64"));
+          const payload = Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, "base64")), decipher.final()]);
+          const decoded = JSON.parse(payload.toString("utf8"));
+          if (JSON.stringify(Object.keys(decoded).sort()) !== JSON.stringify(["files"]) || !Array.isArray(decoded.files) || JSON.stringify(decoded.files.map((file) => file.name)) !== JSON.stringify(expected)) throw new Error("refusing: sealed command file set differs");
+          mkdirSync(output, { mode: 0o700 });
+          for (const file of decoded.files) {
+            if (JSON.stringify(Object.keys(file).sort()) !== JSON.stringify(["bytes", "data", "digest", "name"])) throw new Error("refusing: sealed command file fields differ");
+            const bytes = Buffer.from(file.data, "base64");
+            const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+            if (!Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > 8388608 || bytes.length !== file.bytes || digest !== file.digest) throw new Error(`refusing: sealed command file ${file.name} differs`);
+            mkdirSync(dirname(join(output, file.name)), { recursive: true, mode: 0o700 });
+            writeFileSync(join(output, file.name), bytes, { flag: "wx", mode: 0o600 });
+          }
+          NODE
+
+      - name: recheck frozen command, replay marker, release main, and registry absence
+        id: preflight
+        env:
+          AUTHORIZATION_ID: ${{ needs.authorize.outputs.authorization_id }}
+          EXPECTED_MANIFEST_DIGEST: ${{ needs.authorize.outputs.command_manifest_digest }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+        run: |
+          set -euo pipefail
+          COMMAND="$RUNNER_TEMP/stage-command"
+          node "$COMMAND/scripts/stage-npm-latest.mjs" verify-command-manifest \
+            --directory "$COMMAND" --expected-digest "$EXPECTED_MANIFEST_DIGEST"
+          node "$COMMAND/scripts/stage-npm-latest.mjs" check-authority --plan "$COMMAND/plan.json"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$GITHUB_SHA" || {
+            echo "refusing: release main advanced"
+            exit 1
+          }
+          REPLAY_NAME="npm-stage-authorization-$AUTHORIZATION_ID"
+          MATCHES=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq ".artifacts[]|select(.name==\"$REPLAY_NAME\")|[.id,.workflow_run.id]|@tsv")
+          test "$(printf '%s\n' "$MATCHES" | sed '/^$/d' | wc -l)" -eq 1 || { echo "refusing: replay marker differs"; exit 1; }
+          REPLAY_ID=$(printf '%s\n' "$MATCHES" | cut -f1)
+          test "$(printf '%s\n' "$MATCHES" | cut -f2)" = "$GITHUB_RUN_ID" || { echo "refusing: replay marker run differs"; exit 1; }
+          EXPECTED_LATEST=$(node -p 'require(process.argv[1]).binding.expectedLatestBefore' "$COMMAND/plan.json")
+          test "$(npm view "$PACKAGE" dist-tags.latest)" = "$EXPECTED_LATEST" || { echo "refusing: latest drifted"; exit 1; }
+          VERSIONS=$(npm view "$PACKAGE" versions --json)
+          node -e '
+            let v=JSON.parse(process.argv[2]); if(typeof v==="string")v=[v];
+            if(!Array.isArray(v)||v.length===0||v.includes(process.argv[1]))process.exit(1);
+          ' "$VERSION" "$VERSIONS" || { echo "refusing: version is no longer absent"; exit 1; }
+          echo "command=$COMMAND" >>"$GITHUB_OUTPUT"
+          echo "replay_id=$REPLAY_ID" >>"$GITHUB_OUTPUT"
+
+      - name: stage exact candidate bytes with immutable latest intent
+        id: mutate
+        env:
+          COMMAND: ${{ steps.preflight.outputs.command }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node "$COMMAND/scripts/stage-npm-latest.mjs" check-authority --plan "$COMMAND/plan.json"
+          npm stage publish "$COMMAND/npm-package.tgz" --tag latest --ignore-scripts --access public --json \
+            >"$RUNNER_TEMP/npm-stage-output.json"
+
+      - name: record the successful stage before any registry postcondition
+        id: staged
+        env:
+          COMMAND: ${{ steps.preflight.outputs.command }}
+          COMMAND_ARTIFACT: ${{ needs.authorize.outputs.command_artifact }}
+          COMMAND_MANIFEST_DIGEST: ${{ needs.authorize.outputs.command_manifest_digest }}
+          REPLAY_ID: ${{ steps.preflight.outputs.replay_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          RESULT=$(node "$COMMAND/scripts/stage-npm-latest.mjs" record-stage \
+            --plan "$COMMAND/plan.json" --selected-candidate "$COMMAND/selected-candidate.json" \
+            --tarball "$COMMAND/npm-package.tgz" --stage-output "$RUNNER_TEMP/npm-stage-output.json" \
+            --actor "$GITHUB_ACTOR" --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" --command-artifact-name "$COMMAND_ARTIFACT" \
+            --command-manifest-digest "$COMMAND_MANIFEST_DIGEST" --replay-artifact-id "$REPLAY_ID" \
+            --output "$RUNNER_TEMP/npm-stage-result.json")
+          STAGE_ID=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).stageId)' "$RESULT")
+          RECEIPT_DIGEST=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).receiptDigest)' "$RESULT")
+          mkdir -p "$RUNNER_TEMP/stage-result"
+          cp "$RUNNER_TEMP/npm-stage-result.json" "$RUNNER_TEMP/stage-result/"
+          echo "stage_id=$STAGE_ID" >>"$GITHUB_OUTPUT"
+          echo "receipt_digest=$RECEIPT_DIGEST" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-stage-result-${{ steps.staged.outputs.stage_id }}
+          path: ${{ runner.temp }}/stage-result/npm-stage-result.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: prove the stage remains private and latest did not move
+        env:
+          COMMAND: ${{ steps.preflight.outputs.command }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+        run: |
+          set -euo pipefail
+          EXPECTED_LATEST=$(node -p 'require(process.argv[1]).binding.expectedLatestBefore' "$COMMAND/plan.json")
+          LATEST_AFTER=$(npm view "$PACKAGE" dist-tags.latest)
+          test "$LATEST_AFTER" = "$EXPECTED_LATEST" || { echo "refusing: latest changed during staging"; exit 1; }
+          VERSIONS_AFTER=$(npm view "$PACKAGE" versions --json)
+          node -e '
+            let v=JSON.parse(process.argv[2]); if(typeof v==="string")v=[v];
+            if(!Array.isArray(v)||v.length===0)process.exit(2);
+            if(v.includes(process.argv[1]))process.exit(1);
+          ' "$VERSION" "$VERSIONS_AFTER" || { echo "refusing: staged version became public before approval"; exit 1; }
+
+      - name: explicit human approval handoff
+        env:
+          RECEIPT_DIGEST: ${{ steps.staged.outputs.receipt_digest }}
+          STAGE_ID: ${{ steps.staged.outputs.stage_id }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+        run: |
+          {
+            echo "## staged; not published"
+            echo
+            echo "- package: $PACKAGE@$VERSION"
+            echo "- intended immutable tag: latest"
+            echo "- stage ID: $STAGE_ID"
+            echo "- stage receipt: $RECEIPT_DIGEST"
+            echo "- next: Nicholas or Charles reviews the staged tarball, then approves with npm 2FA"
+            echo "- CLI approval: npm stage approve $STAGE_ID"
+            echo "- after approval: dispatch verify-npm-stage-approval with a signed approval attestation"
+          } >>"$GITHUB_STEP_SUMMARY"
