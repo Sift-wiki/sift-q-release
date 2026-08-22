@@ -16,7 +16,10 @@ const cfg = workflow
 const verifyJob = cfg.slice(cfg.indexOf("\n  verify:"));
 
 test("latest verification is manual, serialized, main-only, and read-only", () => {
-  const trigger = cfg.slice(cfg.indexOf("\non:"), cfg.indexOf("\npermissions:"));
+  const trigger = cfg.slice(
+    cfg.indexOf("\non:"),
+    cfg.indexOf("\npermissions:"),
+  );
   assert.match(trigger, /workflow_dispatch:/);
   assert.doesNotMatch(
     trigger,
@@ -27,7 +30,10 @@ test("latest verification is manual, serialized, main-only, and read-only", () =
   assert.match(verifyJob, /github\.ref == 'refs\/heads\/main'/);
   assert.match(verifyJob, /environment: production/);
   assert.match(verifyJob, /permissions:\n\s+actions: read\n\s+contents: read/);
-  assert.doesNotMatch(verifyJob, /id-token: write|npm publish|npm dist-tag|npm stage|NODE_AUTH_TOKEN|NPM_TOKEN/);
+  assert.doesNotMatch(
+    verifyJob,
+    /id-token: write|npm publish|npm dist-tag|npm stage|NODE_AUTH_TOKEN|NPM_TOKEN/,
+  );
 });
 
 test("only Nicholas and Charles can dispatch runtime verification", () => {
@@ -54,8 +60,14 @@ test("transition selection binds the exact current release main and exact artifa
     verifyJob,
     /run\.path === "\.github\/workflows\/publish-npm\.yml"/,
   );
-  assert.match(verifyJob, /run\.head_branch === "main" && run\.head_sha === expectedSha/);
-  assert.match(verifyJob, /run\.repository\?\.full_name === expectedRepository/);
+  assert.match(
+    verifyJob,
+    /run\.head_branch === "main" && run\.head_sha === expectedSha/,
+  );
+  assert.match(
+    verifyJob,
+    /run\.repository\?\.full_name === expectedRepository/,
+  );
   assert.match(verifyJob, /matches\.length === 1/);
   assert.match(verifyJob, /npm-next-transition\.json/);
   assert.match(verifyJob, /npm-latest-promotion-binding\.json/);
@@ -68,10 +80,23 @@ test("signed authorization, tag state, registry bytes, and replay marker are all
   assert.match(verifyJob, /--triggering-actor "\$GITHUB_TRIGGERING_ACTOR"/);
   assert.match(verifyJob, /dist-tags\.next/);
   assert.match(verifyJob, /dist-tags\.latest/);
+  assert.match(verifyJob, /npm view "\$PACKAGE" maintainers --json/);
+  assert.match(verifyJob, /npm-provider-state\.mjs maintainers/);
   assert.match(verifyJob, /registry-package\.tgz/);
-  assert.match(verifyJob, /signed promotion authorization was already consumed/);
+  assert.match(
+    verifyJob,
+    /signed promotion authorization was already consumed/,
+  );
   assert.match(verifyJob, /npm-latest-verification-\$AUTHORIZATION_ID/);
   assert.match(verifyJob, /signed-npm-latest-promotion\.json/);
+  assert.match(
+    verifyJob,
+    /cp "\$BOUNDARY\/transition\/npm-next-transition\.json"[\s\S]*?latest-verification\/npm-next-transition\.json/,
+  );
+  assert.match(
+    verifyJob,
+    /cp "\$BOUNDARY\/transition\/npm-latest-promotion-binding\.json"[\s\S]*?latest-verification\/npm-latest-promotion-binding\.json/,
+  );
   assert.match(verifyJob, /retention-days: 90/);
 });
 

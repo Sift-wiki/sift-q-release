@@ -4,6 +4,11 @@ import { lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gunzipSync } from "node:zlib";
+import {
+  candidateReceiptDigest,
+  validateDevelopmentCandidate,
+} from "./vendor/ol/candidate-contract.mjs";
+import { validateSignedNpmRuntimeCanary } from "./vendor/ol/npm-publisher-contract.mjs";
 
 export const SOURCE_REPOSITORY = "Sift-wiki/sift-q-refactor";
 export const SOURCE_REPOSITORY_ID = 1_329_084_838;
@@ -308,7 +313,6 @@ export function validateCandidateFiles(directory) {
 }
 
 export async function verifyCandidate({
-  sourceRoot,
   candidateDirectory,
   trustPolicyPath,
   selection,
@@ -326,13 +330,6 @@ export async function verifyCandidate({
   );
   validateCandidateFiles(candidateDirectory);
 
-  const source = resolve(sourceRoot);
-  const candidateContract = await import(
-    pathToFileURL(resolve(source, "scripts/ol/candidate-contract.mjs")).href
-  );
-  const npmContract = await import(
-    pathToFileURL(resolve(source, "scripts/ol/npm-publisher-contract.mjs")).href
-  );
   const candidate = jsonFile(
     resolve(candidateDirectory, "signed-development-candidate.json"),
   );
@@ -359,8 +356,7 @@ export async function verifyCandidate({
     "candidate trust production environment differs",
   );
   invariant(
-    candidateContract.candidateReceiptDigest(candidate) ===
-      expectedReceiptDigest,
+    candidateReceiptDigest(candidate) === expectedReceiptDigest,
     "candidate receipt digest differs",
   );
 
@@ -371,14 +367,14 @@ export async function verifyCandidate({
     sha: selection.sourceSha,
     treeSha,
   };
-  const payload = candidateContract.validateDevelopmentCandidate({
+  const payload = validateDevelopmentCandidate({
     signedCandidate: candidate,
     trustPolicy,
     expectedSource,
     now,
   });
   const npmArtifact = payload.artifacts.npm;
-  npmContract.validateSignedNpmRuntimeCanary({
+  validateSignedNpmRuntimeCanary({
     signedRuntimeCanary: runtimeCanary,
     trustPolicy,
     expectedSource,
@@ -485,7 +481,6 @@ async function main(argv) {
   }
   if (command === "verify-candidate") {
     const result = await verifyCandidate({
-      sourceRoot: required(values, "--source-root"),
       candidateDirectory: required(values, "--candidate-directory"),
       trustPolicyPath: required(values, "--trust-policy"),
       selection: jsonFile(required(values, "--selection")),

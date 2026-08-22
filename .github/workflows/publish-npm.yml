@@ -189,7 +189,6 @@ jobs:
           }
           printf '%s' "$CANDIDATE_TRUST_POLICY_JSON" >"$BOUNDARY/trust-policy.json"
           node relay/scripts/verify-exact-candidate.mjs verify-candidate \
-            --source-root source \
             --candidate-directory "$RUNNER_TEMP/development-candidate" \
             --trust-policy "$BOUNDARY/trust-policy.json" \
             --selection "$BOUNDARY/selection.json" \
@@ -216,7 +215,6 @@ jobs:
 
       - name: refuse an already-published or unreadable registry version
         env:
-          DRY_RUN: ${{ inputs.dry_run }}
           VERSION: ${{ steps.candidate.outputs.version }}
         run: |
           set -euo pipefail
@@ -230,13 +228,24 @@ jobs:
             try { versions = JSON.parse(body); } catch { process.exit(2); }
             if (typeof versions === "string") versions = [versions];
             if (!Array.isArray(versions) || versions.length === 0) process.exit(2);
-            if (versions.includes(version) && process.env.DRY_RUN !== "true") process.exit(3);
+            if (versions.includes(version)) process.exit(3);
           ' "$VERSION" "$PUBLISHED" || {
             STATUS=$?
             test "$STATUS" = 3 && echo "refusing: $PACKAGE@$VERSION already exists"
             test "$STATUS" = 2 && echo "refusing: npm returned an unreadable version list"
             exit 1
           }
+          MAINTAINERS=$(npm view "$PACKAGE" maintainers --json) || {
+            echo "refusing: cannot read npm maintainer authority"
+            exit 1
+          }
+          DIST_TAGS=$(npm view "$PACKAGE" dist-tags --json) || {
+            echo "refusing: cannot read npm dist-tags"
+            exit 1
+          }
+          node relay/scripts/npm-provider-state.mjs preflight \
+            --candidate "$VERSION" --maintainers-json "$MAINTAINERS" \
+            --dist-tags-json "$DIST_TAGS"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !inputs.dry_run }}
@@ -276,6 +285,7 @@ jobs:
     outputs:
       latest_before: ${{ steps.registry_preflight.outputs.latest_before }}
       next_before: ${{ steps.registry_preflight.outputs.next_before }}
+      provider_maintainers: ${{ steps.registry_preflight.outputs.provider_maintainers }}
     env:
       NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
       NPM_CONFIG_USERCONFIG: /dev/null
@@ -299,6 +309,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: relay
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: install the exact npm OIDC client
         working-directory: ${{ runner.temp }}
@@ -332,27 +348,24 @@ jobs:
           }
           ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
           test "$ACTUAL" = "$EXPECTED_SHA256" || { echo "refusing: tarball changed after selection"; exit 1; }
+          test "$(git -C relay rev-parse HEAD)" = "$GITHUB_SHA" || {
+            echo "refusing: public provider verifier checkout differs from the dispatched release SHA"
+            exit 1
+          }
+          MAINTAINERS=$(npm view "$PACKAGE" maintainers --json) || {
+            echo "refusing: cannot read the npm maintainer authority"
+            exit 1
+          }
           DIST_TAGS=$(npm view "$PACKAGE" dist-tags --json) || {
             echo "refusing: cannot read the existing dist-tags"
             exit 1
           }
-          TAG_STATE=$(node --input-type=module - "$VERSION" "$DIST_TAGS" <<'NODE'
-          const [candidate, encoded] = process.argv.slice(2);
-          const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
-          let tags;
-          try { tags = JSON.parse(encoded); } catch { throw new Error("refusing: dist-tags response is not JSON"); }
-          if (tags === null || typeof tags !== "object" || Array.isArray(tags) || !stable.test(tags.latest ?? "")) {
-            throw new Error("refusing: existing latest tag is invalid");
-          }
-          if (Object.hasOwn(tags, "next") && (!stable.test(tags.next) || tags.next !== tags.latest)) {
-            throw new Error("refusing: next identifies an in-flight candidate distinct from latest");
-          }
-          if (!stable.test(candidate)) throw new Error("refusing: candidate version is invalid");
-          process.stdout.write(JSON.stringify({ latest: tags.latest, nextBefore: tags.next ?? null }));
-          NODE
-          ) || exit 1
+          TAG_STATE=$(node relay/scripts/npm-provider-state.mjs preflight \
+            --candidate "$VERSION" --maintainers-json "$MAINTAINERS" \
+            --dist-tags-json "$DIST_TAGS") || exit 1
           LATEST_BEFORE=$(node -p 'require("node:process").argv[1] && JSON.parse(require("node:process").argv[1]).latest' "$TAG_STATE")
           NEXT_BEFORE=$(node -p 'const value=JSON.parse(require("node:process").argv[1]).nextBefore; value === null ? "absent" : value' "$TAG_STATE")
+          PROVIDER_MAINTAINERS=$(node -p 'JSON.stringify(JSON.parse(require("node:process").argv[1]).maintainers)' "$TAG_STATE")
           node -e '
             const parse = value => value.split(".").map(BigInt);
             const [candidate, latest] = process.argv.slice(1).map(parse);
@@ -382,13 +395,40 @@ jobs:
           echo "PUBLISH_TARBALL=$TARBALL" >>"$GITHUB_ENV"
           echo "LATEST_BEFORE=$LATEST_BEFORE" >>"$GITHUB_ENV"
           echo "NEXT_BEFORE=$NEXT_BEFORE" >>"$GITHUB_ENV"
+          echo "PROVIDER_STATE_BEFORE=$TAG_STATE" >>"$GITHUB_ENV"
           echo "latest_before=$LATEST_BEFORE" >>"$GITHUB_OUTPUT"
           echo "next_before=$NEXT_BEFORE" >>"$GITHUB_OUTPUT"
+          echo "provider_maintainers=$PROVIDER_MAINTAINERS" >>"$GITHUB_OUTPUT"
 
       - name: publish the exact candidate to next with OIDC trusted publishing
         env:
           NPM_CONFIG_PROVENANCE: "false"
-        run: npm publish "$PUBLISH_TARBALL" --tag next --ignore-scripts --access public --loglevel verbose
+          VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          set -euo pipefail
+          MAINTAINERS_NOW=$(npm view "$PACKAGE" maintainers --json) || {
+            echo "refusing: cannot re-read npm maintainer authority immediately before publish"
+            exit 1
+          }
+          TAGS_NOW=$(npm view "$PACKAGE" dist-tags --json) || {
+            echo "refusing: cannot re-read npm dist-tags immediately before publish"
+            exit 1
+          }
+          node relay/scripts/npm-provider-state.mjs prepublish \
+            --before-json "$PROVIDER_STATE_BEFORE" --candidate "$VERSION" \
+            --maintainers-json "$MAINTAINERS_NOW" --dist-tags-json "$TAGS_NOW"
+          npm publish "$PUBLISH_TARBALL" --tag next --ignore-scripts --access public --loglevel verbose
+          MAINTAINERS_AFTER=$(npm view "$PACKAGE" maintainers --json) || {
+            echo "refusing: cannot read npm maintainer authority immediately after publish"
+            exit 1
+          }
+          TAGS_AFTER=$(npm view "$PACKAGE" dist-tags --json) || {
+            echo "refusing: cannot read npm dist-tags immediately after publish"
+            exit 1
+          }
+          node relay/scripts/npm-provider-state.mjs postpublish \
+            --before-json "$PROVIDER_STATE_BEFORE" --candidate "$VERSION" \
+            --maintainers-json "$MAINTAINERS_AFTER" --dist-tags-json "$TAGS_AFTER"
 
   verify-registry:
     name: verify registry bytes without write authority
@@ -437,6 +477,7 @@ jobs:
           EXPECTED_SHA256: ${{ needs.select.outputs.tarball_sha256 }}
           LATEST_BEFORE: ${{ needs.publish.outputs.latest_before }}
           NEXT_BEFORE: ${{ needs.publish.outputs.next_before }}
+          PROVIDER_MAINTAINERS: ${{ needs.publish.outputs.provider_maintainers }}
           SOURCE_SHA: ${{ needs.select.outputs.source_sha }}
           TREE_SHA: ${{ needs.select.outputs.tree_sha }}
           VERSION: ${{ needs.select.outputs.version }}
@@ -514,6 +555,16 @@ jobs:
             echo "refusing: latest changed during next publication or canary"
             exit 1
           }
+          MAINTAINERS_AFTER_CANARY=$(npm view "$PACKAGE" maintainers --json) || {
+            echo "refusing: cannot read npm maintainer authority after the registry canary"
+            exit 1
+          }
+          VERIFIED_MAINTAINERS=$(node relay/scripts/npm-provider-state.mjs maintainers \
+            --maintainers-json "$MAINTAINERS_AFTER_CANARY") || exit 1
+          test "$VERIFIED_MAINTAINERS" = "$PROVIDER_MAINTAINERS" || {
+            echo "refusing: npm maintainer authority changed after publication"
+            exit 1
+          }
           node relay/scripts/verify-registry-transition.mjs record \
             --selected-tarball "$TARBALL" \
             --registry-tarball "$REGISTRY_TARBALL" \
@@ -525,6 +576,7 @@ jobs:
             --candidate-receipt-digest "$CANDIDATE_RECEIPT_DIGEST" \
             --latest-before "$LATEST_BEFORE" --latest-after "$LATEST_AFTER_CANARY" \
             --next-before "$NEXT_BEFORE" \
+            --provider-maintainers "$VERIFIED_MAINTAINERS" \
             --version "$VERSION" --next-tag-version "$NEXT_AFTER_CANARY" \
             --output "$TRANSITION_DIR/npm-next-transition.json" \
             --promotion-binding-output "$TRANSITION_DIR/npm-latest-promotion-binding.json" \

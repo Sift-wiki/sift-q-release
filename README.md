@@ -28,7 +28,9 @@ repository's GitHub-hosted jobs are unavailable.
    tarball, rechecks its digest and registry absence, and refuses to write if
    `next` identifies any in-flight version distinct from `latest`. It then
    publishes those exact bytes under the `next` dist-tag. It has no
-   private-repository credential or private checkout.
+   private-repository credential or private checkout. It checks out only this
+   public release repository at the dispatched SHA to run the reviewed provider
+   authority verifier.
 5. A separate no-OIDC, no-secret, no-write job fetches that exact version back
    through the canonical npm registry, proves the registry tarball is
    byte-identical to the selected candidate, installs those registry-served
@@ -44,10 +46,11 @@ repository's GitHub-hosted jobs are unavailable.
    workflow has no OIDC or registry-write credential. A different production
    owner must approve the environment. It proves the signed binding, exact
    release-main SHA, replay state, `next` and `latest`, canonical registry
-   metadata, and public tarball bytes, then emits a durable verification receipt.
+   metadata, and public tarball bytes, then emits a bounded-retention GitHub
+   verification bundle containing the complete transition evidence.
 8. Rollback is roll-forward: npm versions are immutable. Before promotion, a
-   bad candidate can be abandoned on `next`; after promotion, it is followed by
-   a fixed patch.
+   bad candidate is reconciled through the governed rejected-`next` procedure;
+   after promotion, it is followed by a fixed patch.
 
 The package ships **without a provenance attestation**. npm would generate one
 automatically for an OIDC publish from this public repository, but it would name
@@ -91,7 +94,7 @@ This repository is the trust root of the npm lane:
   `NPM_LATEST_PROMOTION_TRUST_POLICY_JSON`. No npm token, private source token,
   or private signing key belongs in `production`.
 - The single npm trusted publisher is restricted to this public repository,
-  `.github/workflows/publish-npm.yml`, the `production` environment, and
+  workflow filename `publish-npm.yml`, the `production` environment, and
   `npm publish`. OIDC is never used for `npm dist-tag`; the final tag mutation is
   an interactive Nicholas/Charles action protected by npm 2FA.
 - Each authority has an independent kill switch. Until every activation item is
@@ -118,13 +121,38 @@ evidence, proves the exact public bytes and tag state, rejects a reused
 authorization ID, and records both the signed authorization and a strict
 read-only verification result.
 
+Create the short-lived owner authorization locally; never store an owner private
+key in GitHub. The helper accepts exactly one protected key path or already-open
+file descriptor, verifies that the key is present in the reviewed trust policy,
+checks the transition binding and the live tag values supplied by the owner,
+writes a mode-0600 receipt, and prints the base64 workflow input:
+
+```sh
+node scripts/authorize-npm-latest-promotion.mjs \
+  --evidence npm-next-transition.json \
+  --binding npm-latest-promotion-binding.json \
+  --trust-policy owner-promotion-trust.json \
+  --private-key /secure/offline/owner-ed25519.pem \
+  --current-latest <latest> --current-next <candidate-version> \
+  --output signed-npm-latest-promotion.json
+```
+
+The authorization lifetime is at most 15 minutes (10 minutes by default).
+From its creation through the final verification, do not merge into release
+`main`: both workflows require the same exact current release SHA. If `main`
+advances or the receipt expires, stop and issue a fresh authorization after
+re-verifying the unchanged transition.
+
 The post-state result JSON is intentionally not signed by a GitHub-held key.
 The archived owner-signed Ed25519 authorization covers the exact transition
 evidence digest and promotion preconditions; its canonical SHA-256 digest is
 embedded in the result. The result's own digest is recorded in the GitHub run
-summary, and its provenance is the immutable GitHub run and artifact. External
-verification therefore checks the owner signature and both canonical digests,
-then relies on GitHub for the run/artifact provenance. This avoids placing a
+summary. The uploaded bundle retains the signed receipt, transition evidence,
+promotion binding, and verification result for 90 days, but GitHub artifacts
+are deletable and expiring; they are not an immutable archive. The owner must
+copy the whole bundle into the owner-controlled release archive before that
+window expires. External verification checks the owner signature and both
+canonical digests, then relies on captured GitHub run metadata. This avoids placing a
 long-lived owner signing secret in GitHub. The owner signature does not cover
 the post-state result, and that result must not be described as independently
 signed.
@@ -138,6 +166,29 @@ npm dist-tag add "@sift-wiki/q@<version>" latest
 Only Nicholas or Charles may run it. npm prompts for 2FA. The command moves a
 label to the already published and canaried version; it cannot alter that
 version's immutable tarball.
+
+The npm registry does not provide compare-and-swap for `npm publish --tag next`.
+The workflow therefore requires the provider maintainer set to equal exactly
+`jxiao1024` and `unobtainiumrock`, snapshots maintainers and tags, rechecks both
+in the same shell step immediately before the write, and rechecks them again
+immediately afterward and after the canary. This fails closed against ordinary
+drift, but it cannot make a concurrent direct npm owner honor a repository lock.
+Removing every other npm maintainer is therefore an activation prerequisite,
+not merely an audit recommendation.
+
+If a canary rejects a version already placed on `next`, never leave that stale
+candidate blocking later releases and never clear it ad hoc. Nicholas or Charles
+runs the read-only status command, records the reason, then performs the explicit
+2FA reset that points `next` back to the unchanged `latest` version and emits a
+mode-0600 reconciliation receipt:
+
+```sh
+node scripts/reconcile-rejected-next.mjs status --rejected-version <version>
+node scripts/reconcile-rejected-next.mjs reset --rejected-version <version> \
+  --confirm RESET-REJECTED-NEXT-TO-LATEST \
+  --reason '<at least 20 characters describing the rejected canary>' \
+  --receipt-output rejected-next-reconciliation.json
+```
 
 ## Break glass
 

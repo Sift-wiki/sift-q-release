@@ -8,6 +8,8 @@ import {
 import {
   mkdtempSync,
   mkdirSync,
+  openSync,
+  closeSync,
   readFileSync,
   rmSync,
   statSync,
@@ -15,7 +17,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { createPromotionAuthorization } from "../scripts/authorize-npm-latest-promotion.mjs";
 import {
   CANONICAL_REGISTRY,
   LATEST_PROMOTION_BINDING_SCHEMA,
@@ -155,6 +159,7 @@ function inputs(
     nextBefore: null,
     version: VERSION,
     nextTagVersion: VERSION,
+    providerMaintainers: ["jxiao1024", "unobtainiumrock"],
     canary: validCanary(),
     outputPath: join(root, "transition.json"),
     promotionBindingPath: join(root, "binding.json"),
@@ -201,6 +206,10 @@ test("records exact registry bytes, a clean CLI canary, and an unsigned promotio
     assert.equal(result.evidence.registry.latestBefore, "1.2.2");
     assert.equal(result.evidence.registry.latestAfter, "1.2.2");
     assert.equal(result.evidence.registry.nextBefore, null);
+    assert.deepEqual(result.evidence.registry.maintainers, [
+      "jxiao1024",
+      "unobtainiumrock",
+    ]);
     assert.deepEqual(result.evidence.canary.dryRunPlan, [
       "fetch-hosted-content",
       "register-claude",
@@ -330,6 +339,17 @@ test("refuses a substituted next tag or registry digest metadata", () => {
       settled.latestBefore,
     );
 
+    const wrongMaintainers = inputs(root, tarball);
+    wrongMaintainers.providerMaintainers = [
+      "goodnight00",
+      "jxiao1024",
+      "unobtainiumrock",
+    ];
+    assert.throws(
+      () => recordRegistryTransition(wrongMaintainers),
+      /npm maintainer authority differs/,
+    );
+
     const wrongDigest = inputs(root, tarball);
     const value = metadata(tarball);
     value.dist.shasum = "f".repeat(40);
@@ -451,6 +471,79 @@ test("promotion authority requires a fresh Ed25519 authorization and exact live 
       }),
       { authorizationId: "authorization-0001", binding },
     );
+    const generated = createPromotionAuthorization({
+      evidence,
+      binding,
+      trustPolicy,
+      privateKeyBytes: privateKey.export({ format: "pem", type: "pkcs8" }),
+      currentLatest: "1.2.2",
+      currentNext: VERSION,
+      authorizationId: "authorization-generated-0001",
+      authorizedAt: new Date("2026-08-21T22:00:00.000Z"),
+      ttlSeconds: 600,
+    });
+    assert.equal(generated.keyId, keyId);
+    assert.equal(generated.authorizationId, "authorization-generated-0001");
+    assert.deepEqual(
+      verifySignedPromotionReceipt({
+        receipt: generated,
+        trustPolicy,
+        evidence,
+        currentLatest: "1.2.2",
+        currentNext: VERSION,
+        now: () => new Date("2026-08-21T22:00:01.000Z"),
+      }).binding,
+      binding,
+    );
+    const evidencePath = join(root, "signer-evidence.json");
+    const bindingPath = join(root, "signer-binding.json");
+    const trustPath = join(root, "signer-trust.json");
+    const keyPath = join(root, "signer-key.pem");
+    writeFileSync(evidencePath, canonicalJson(evidence));
+    writeFileSync(bindingPath, canonicalJson(binding));
+    writeFileSync(trustPath, canonicalJson(trustPolicy));
+    writeFileSync(
+      keyPath,
+      privateKey.export({ format: "pem", type: "pkcs8" }),
+      { mode: 0o600 },
+    );
+    const signer = fileURLToPath(
+      new URL("../scripts/authorize-npm-latest-promotion.mjs", import.meta.url),
+    );
+    const common = [
+      signer,
+      "--evidence",
+      evidencePath,
+      "--binding",
+      bindingPath,
+      "--trust-policy",
+      trustPath,
+      "--current-latest",
+      "1.2.2",
+      "--current-next",
+      VERSION,
+    ];
+    const pathOutput = join(root, "signed-by-path.json");
+    execFileSync(process.execPath, [
+      ...common,
+      "--private-key",
+      keyPath,
+      "--output",
+      pathOutput,
+    ]);
+    assert.equal(statSync(pathOutput).mode & 0o777, 0o600);
+    const fdOutput = join(root, "signed-by-fd.json");
+    const keyFd = openSync(keyPath, "r");
+    try {
+      execFileSync(
+        process.execPath,
+        [...common, "--private-key-fd", "3", "--output", fdOutput],
+        { stdio: ["ignore", "pipe", "pipe", keyFd] },
+      );
+    } finally {
+      closeSync(keyFd);
+    }
+    assert.equal(statSync(fdOutput).mode & 0o777, 0o600);
     assert.throws(
       () =>
         verifySignedPromotionReceipt({
@@ -661,10 +754,7 @@ test("read-only promotion verification binds owner, exact tags, release main, an
       now: VERIFY_NOW,
     };
     const verified = verifyCompletedPromotion(base);
-    assert.equal(
-      verified.result.schemaVersion,
-      LATEST_PROMOTION_RESULT_SCHEMA,
-    );
+    assert.equal(verified.result.schemaVersion, LATEST_PROMOTION_RESULT_SCHEMA);
     assert.equal(
       verified.result.authority,
       "read-only-post-promotion-verification",

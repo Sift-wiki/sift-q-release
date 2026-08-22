@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -108,40 +107,21 @@ test("the OIDC job has a separate production kill switch and no selection author
   );
 });
 
-test("the actual pre-write tag parser accepts only absent or settled next", () => {
-  const match = publishJob.match(
-    /TAG_STATE=\$\(node --input-type=module - "\$VERSION" "\$DIST_TAGS" <<'NODE'\n([\s\S]*?)\n\s+NODE\n/,
-  );
-  assert.ok(match, "embedded dist-tag parser is present");
-  const program = match[1].replace(/^ {10}/gm, "");
-  const run = (tags) =>
-    spawnSync(process.execPath, ["--input-type=module", "-", "1.2.3", JSON.stringify(tags)], {
-      encoding: "utf8",
-      input: program,
-    });
-
-  for (const tags of [
-    { latest: "1.2.2" },
-    { latest: "1.2.2", next: "1.2.2" },
-  ]) {
-    const result = run(tags);
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), {
-      latest: "1.2.2",
-      nextBefore: tags.next ?? null,
-    });
-  }
-
-  for (const next of ["1.2.1", "1.2.3", "1.3.0"]) {
-    const result = run({ latest: "1.2.2", next });
-    assert.notEqual(result.status, 0, `distinct next ${next} must refuse`);
-    assert.match(result.stderr, /in-flight candidate distinct from latest/);
-  }
-
+test("the checked-in provider verifier gates owners and tags before and after the write", () => {
+  assert.match(publishJob, /npm-provider-state\.mjs preflight/);
+  assert.match(publishJob, /npm-provider-state\.mjs prepublish/);
+  assert.match(publishJob, /npm-provider-state\.mjs postpublish/);
+  assert.match(publishJob, /npm view "\$PACKAGE" maintainers --json/g);
   const parserAt = publishJob.indexOf("DIST_TAGS=$(npm view");
   const publishAt = publishJob.indexOf('npm publish "$PUBLISH_TARBALL"');
-  assert.ok(parserAt > 0 && publishAt > parserAt, "tag precondition precedes npm write");
-  assert.match(publishJob, /next_before: \$\{\{ steps\.registry_preflight\.outputs\.next_before \}\}/);
+  assert.ok(
+    parserAt > 0 && publishAt > parserAt,
+    "tag precondition precedes npm write",
+  );
+  assert.match(
+    publishJob,
+    /next_before: \$\{\{ steps\.registry_preflight\.outputs\.next_before \}\}/,
+  );
   assert.match(verifyRegistryJob, /--next-before "\$NEXT_BEFORE"/);
 });
 
@@ -169,10 +149,11 @@ test("repo-only credential exists only in select and persisted checkout credenti
   assert.match(selectJob, /token: \$\{\{ secrets\.SIFT_Q_READ_TOKEN \}\}/);
   assert.equal((selectJob.match(/SIFT_Q_READ_TOKEN/g) ?? []).length, 3);
   assert.doesNotMatch(publishJob, /SIFT_Q_READ_TOKEN|sift-q-refactor/);
-  assert.doesNotMatch(
+  assert.match(
     publishJob,
-    /uses: actions\/checkout|verify-registry-transition|sift-q --/,
+    /path: relay[\s\S]*?persist-credentials: false[\s\S]*?ref: \$\{\{ github\.sha \}\}/,
   );
+  assert.doesNotMatch(publishJob, /verify-registry-transition|sift-q --/);
   assert.match(
     verifyRegistryJob,
     /path: relay[\s\S]*?persist-credentials: false[\s\S]*?ref: \$\{\{ github\.sha \}\}/,
@@ -272,7 +253,7 @@ test("publish receives only one digest-pinned tarball and publishes those exact 
   );
   assert.deepEqual(
     uses.map((value) => value.split("@")[0]),
-    ["actions/setup-node", "actions/download-artifact"],
+    ["actions/setup-node", "actions/checkout", "actions/download-artifact"],
   );
   assert.match(publishJob, /name: exact-candidate-tarball/);
   assert.match(publishJob, /test "\$ACTUAL" = "\$EXPECTED_SHA256"/);
@@ -337,6 +318,20 @@ test("registry absence is checked before upload and immediately before publish",
   const preflightAt = publishJob.indexOf('npm view "$PACKAGE" versions --json');
   const publishAt = publishJob.indexOf('npm publish "$PUBLISH_TARBALL"');
   assert.ok(preflightAt > 0 && publishAt > preflightAt);
+});
+
+test("dry-run qualification also refuses an already-published version", () => {
+  const refusal = selectJob.slice(
+    selectJob.indexOf("name: refuse an already-published"),
+    selectJob.indexOf("uses: actions/upload-artifact"),
+  );
+  assert.match(
+    refusal,
+    /if \(versions\.includes\(version\)\) process\.exit\(3\)/,
+  );
+  assert.doesNotMatch(refusal, /DRY_RUN|inputs\.dry_run/);
+  assert.match(refusal, /npm view "\$PACKAGE" maintainers --json/);
+  assert.match(refusal, /npm-provider-state\.mjs preflight/);
 });
 
 test("the OIDC write targets next and cannot move latest", () => {

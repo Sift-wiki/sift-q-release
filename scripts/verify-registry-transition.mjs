@@ -26,8 +26,9 @@ import {
   packageManifestFromTarball,
   PACKAGE_REPOSITORY,
 } from "./verify-exact-candidate.mjs";
+import { EXPECTED_MAINTAINERS } from "./npm-provider-state.mjs";
 
-export const NEXT_TRANSITION_SCHEMA = "sift-q-npm-next-transition/v1";
+export const NEXT_TRANSITION_SCHEMA = "sift-q-npm-next-transition/v2";
 export const LATEST_PROMOTION_BINDING_SCHEMA =
   "sift-q-npm-latest-promotion-binding/v1";
 export const SIGNED_LATEST_PROMOTION_SCHEMA =
@@ -441,6 +442,7 @@ export function validateNextTransitionEvidence(value) {
       "integrity",
       "latestAfter",
       "latestBefore",
+      "maintainers",
       "nextBefore",
       "registry",
       "shasum",
@@ -453,6 +455,8 @@ export function validateNextTransitionEvidence(value) {
       value.registry.distTag === "next" &&
       value.registry.distTagVersion === value.package.version &&
       value.registry.latestBefore === value.registry.latestAfter &&
+      canonicalJson(value.registry.maintainers) ===
+        canonicalJson(EXPECTED_MAINTAINERS) &&
       STABLE_VERSION.test(value.registry.latestBefore) &&
       (value.registry.nextBefore === null ||
         value.registry.nextBefore === value.registry.latestBefore) &&
@@ -716,7 +720,10 @@ export function verifyCompletedPromotion({
   outputPath,
   now = () => new Date(),
 }) {
-  invariant(PRODUCTION_ACTORS.includes(actor), "promotion actor is not a production owner");
+  invariant(
+    PRODUCTION_ACTORS.includes(actor),
+    "promotion actor is not a production owner",
+  );
   invariant(
     PRODUCTION_ACTORS.includes(triggeringActor),
     "promotion triggering actor is not a production owner",
@@ -815,6 +822,7 @@ export function recordRegistryTransition({
   nextBefore,
   version,
   nextTagVersion,
+  providerMaintainers,
   canary,
   outputPath,
   promotionBindingPath,
@@ -848,6 +856,10 @@ export function recordRegistryTransition({
   invariant(
     nextBefore === null || nextBefore === latestBefore,
     "next precondition identifies a distinct in-flight candidate",
+  );
+  invariant(
+    canonicalJson(providerMaintainers) === canonicalJson(EXPECTED_MAINTAINERS),
+    "npm maintainer authority differs",
   );
   invariant(
     compareStableVersions(version, latestBefore) > 0,
@@ -901,6 +913,7 @@ export function recordRegistryTransition({
       integrity: registryMetadata.integrity,
       latestAfter,
       latestBefore,
+      maintainers: providerMaintainers,
       nextBefore,
       registry: CANONICAL_REGISTRY,
       shasum: registryMetadata.shasum,
@@ -974,6 +987,7 @@ async function main(argv) {
       "--next-tag-version",
       "--output",
       "--promotion-binding-output",
+      "--provider-maintainers",
       "--registry-metadata",
       "--registry-tarball",
       "--selected-tarball",
@@ -1005,6 +1019,9 @@ async function main(argv) {
           : required(values, "--next-before"),
       version: required(values, "--version"),
       nextTagVersion: required(values, "--next-tag-version"),
+      providerMaintainers: JSON.parse(
+        required(values, "--provider-maintainers"),
+      ),
       canary: jsonFile(required(values, "--canary"), "registry canary"),
       outputPath: required(values, "--output"),
       promotionBindingPath: required(values, "--promotion-binding-output"),
@@ -1087,20 +1104,38 @@ async function main(argv) {
       ]),
     );
     const output = verifyCompletedPromotion({
-      receipt: jsonFile(required(values, "--receipt"), "signed promotion receipt"),
-      trustPolicy: jsonFile(required(values, "--trust-policy"), "promotion trust policy"),
+      receipt: jsonFile(
+        required(values, "--receipt"),
+        "signed promotion receipt",
+      ),
+      trustPolicy: jsonFile(
+        required(values, "--trust-policy"),
+        "promotion trust policy",
+      ),
       evidence: jsonFile(required(values, "--evidence"), "transition evidence"),
       currentLatest: required(values, "--current-latest"),
       currentNext: required(values, "--current-next"),
-      registryMetadata: jsonFile(required(values, "--registry-metadata"), "registry metadata"),
+      registryMetadata: jsonFile(
+        required(values, "--registry-metadata"),
+        "registry metadata",
+      ),
       registryTarballPath: required(values, "--registry-tarball"),
       actor: required(values, "--actor"),
       triggeringActor: required(values, "--triggering-actor"),
       releaseRepository: required(values, "--release-repository"),
       releaseSha: required(values, "--release-sha"),
-      workflowRunId: positiveInteger(required(values, "--workflow-run-id"), "promotion workflow run id"),
-      workflowRunAttempt: positiveInteger(required(values, "--workflow-run-attempt"), "promotion workflow run attempt"),
-      transitionRunId: positiveInteger(required(values, "--transition-run-id"), "promotion transition run id"),
+      workflowRunId: positiveInteger(
+        required(values, "--workflow-run-id"),
+        "promotion workflow run id",
+      ),
+      workflowRunAttempt: positiveInteger(
+        required(values, "--workflow-run-attempt"),
+        "promotion workflow run attempt",
+      ),
+      transitionRunId: positiveInteger(
+        required(values, "--transition-run-id"),
+        "promotion transition run id",
+      ),
       outputPath: required(values, "--output"),
     });
     process.stdout.write(

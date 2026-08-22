@@ -148,6 +148,8 @@ jobs:
           VERSION=$(node -p 'require(process.argv[1]).package.version' "$BOUNDARY/transition/npm-next-transition.json")
           NEXT=$(npm view "$PACKAGE" dist-tags.next) || { echo "refusing: cannot read next"; exit 1; }
           LATEST=$(npm view "$PACKAGE" dist-tags.latest) || { echo "refusing: cannot read latest"; exit 1; }
+          MAINTAINERS=$(npm view "$PACKAGE" maintainers --json) || { echo "refusing: cannot read npm maintainer authority"; exit 1; }
+          node scripts/npm-provider-state.mjs maintainers --maintainers-json "$MAINTAINERS"
           npm view "$PACKAGE@$VERSION" --json >"$BOUNDARY/registry-metadata.json" || {
             echo "refusing: promoted version is not public"
             exit 1
@@ -187,6 +189,10 @@ jobs:
             exit 1
           }
           cp "$BOUNDARY/signed-promotion.json" "$RUNNER_TEMP/latest-verification/signed-npm-latest-promotion.json"
+          cp "$BOUNDARY/transition/npm-next-transition.json" \
+            "$RUNNER_TEMP/latest-verification/npm-next-transition.json"
+          cp "$BOUNDARY/transition/npm-latest-promotion-binding.json" \
+            "$RUNNER_TEMP/latest-verification/npm-latest-promotion-binding.json"
           echo "artifact_name=$ARTIFACT_NAME" >>"$GITHUB_OUTPUT"
           echo "authorization_id=$AUTHORIZATION_ID" >>"$GITHUB_OUTPUT"
           echo "receipt_digest=$RECEIPT_DIGEST" >>"$GITHUB_OUTPUT"

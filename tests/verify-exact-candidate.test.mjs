@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
@@ -13,6 +13,21 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import {
+  DEVELOPMENT_CANDIDATE_SCHEMA,
+  SIGNED_DEVELOPMENT_CANDIDATE_SCHEMA,
+  candidateReceiptDigest,
+  signingKeyId,
+} from "../scripts/vendor/ol/candidate-contract.mjs";
+import {
+  NPM_RUNTIME_CANARY_SCHEMA,
+  SIGNED_NPM_RUNTIME_CANARY_SCHEMA,
+  runtimeCanaryReceiptDigest,
+} from "../scripts/vendor/ol/npm-publisher-contract.mjs";
+import {
+  canonicalJson,
+  sha256Digest,
+} from "../scripts/vendor/ol/readiness-contract.mjs";
 import {
   CANDIDATE_ARTIFACT_NAME,
   CANDIDATE_FILES,
@@ -254,42 +269,216 @@ test("candidate directory refuses a symlink in place of an expected file", () =>
   }
 });
 
+test("candidate verification executes only pinned public verifier code", () => {
+  const verifier = readFileSync(
+    new URL("../scripts/verify-exact-candidate.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(verifier, /\.\/vendor\/ol\/candidate-contract\.mjs/);
+  assert.match(verifier, /\.\/vendor\/ol\/npm-publisher-contract\.mjs/);
+  assert.doesNotMatch(
+    verifier,
+    /sourceRoot|--source-root|scripts\/ol\/candidate-contract/,
+  );
+  for (const name of [
+    "candidate-contract.mjs",
+    "readiness-contract.mjs",
+    "npm-publisher-contract.mjs",
+  ]) {
+    const source = readFileSync(
+      new URL(`../scripts/vendor/ol/${name}`, import.meta.url),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /Sift-wiki\/sift-q-refactor@4647c4cc8cd665f91385fcf248219c27c99870a9/,
+    );
+  }
+});
+
 function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function signedCandidateFixture(tarball) {
+  const now = Date.parse("2026-08-21T00:00:00.000Z");
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const publicKeySpkiBase64 = publicKey
+    .export({ format: "der", type: "spki" })
+    .toString("base64");
+  const keyId = signingKeyId(publicKeySpkiBase64);
+  const trustPolicy = {
+    candidateKeyId: keyId,
+    candidatePublicKeySpkiBase64: publicKeySpkiBase64,
+    clockSkewSeconds: 60,
+    developmentEnvironmentId: "sift-q-development",
+    maximumEvidenceAgeSeconds: 3_600,
+    maximumReceiptLifetimeSeconds: 3_600,
+    npmPackageName: "@sift-wiki/q",
+    productionEnvironmentId: "sift-q-production",
+    repository: SOURCE_REPOSITORY,
+  };
+  const source = {
+    ref: "refs/heads/main",
+    sha: candidateSha,
+    treeSha,
+  };
+  const tarballDigest = digest(tarball);
+  const runtimePayload = {
+    schemaVersion: NPM_RUNTIME_CANARY_SCHEMA,
+    repository: SOURCE_REPOSITORY,
+    source: structuredClone(source),
+    package: { name: "@sift-wiki/q", version: "1.2.3", tarballDigest },
+    homeIsolation: "fresh-empty-temporary-home",
+    install: {
+      command: "npm install ./npm-package.tgz --no-audit --no-fund",
+      scriptsPolicy: "consumer-default",
+      exitCode: 0,
+      stdout: "added 1 package\n",
+      stderr: "",
+    },
+    version: {
+      command: "sift-q --version",
+      exitCode: 0,
+      stdout: "sift-q 1.2.3\n",
+      stderr: "",
+    },
+    dryRun: {
+      command: "sift-q --dry-run --json --client claude",
+      harness: "claude",
+      exitCode: 0,
+      stdout: JSON.stringify({
+        detection: { platform: { ok: true } },
+        plan: [{ id: "fetch-hosted-content" }, { id: "register-claude" }],
+        result: { stepResults: [] },
+      }),
+      stderr: "",
+    },
+    finishedAt: "2026-08-20T23:35:00.000Z",
+  };
+  const signedRuntimeCanary = {
+    schemaVersion: SIGNED_NPM_RUNTIME_CANARY_SCHEMA,
+    keyId,
+    payload: runtimePayload,
+    signatureBase64: sign(
+      null,
+      Buffer.from(canonicalJson(runtimePayload)),
+      privateKey,
+    ).toString("base64"),
+  };
+  const runtimeCanaryDigest = runtimeCanaryReceiptDigest(signedRuntimeCanary);
+  const npmArtifact = {
+    packageName: "@sift-wiki/q",
+    version: "1.2.3",
+    tarballDigest,
+    runtimeCanaryReceiptDigest: runtimeCanaryDigest,
+  };
+  const hostedImageDigest = sha256Digest({ fixture: "hosted" });
+  const hostedNpmArtifacts = {
+    indexDigest: hostedImageDigest,
+    packageName: npmArtifact.packageName,
+    platforms: {
+      "linux/amd64": {
+        imageManifestDigest: sha256Digest({ fixture: "hosted-amd64" }),
+        tarballDigest,
+      },
+      "linux/arm64": {
+        imageManifestDigest: sha256Digest({ fixture: "hosted-arm64" }),
+        tarballDigest,
+      },
+    },
+    tarballDigest,
+    version: npmArtifact.version,
+  };
+  const artifacts = {
+    configuration: {
+      runtimeDigest: sha256Digest({ fixture: "runtime" }),
+      schemaDigest: sha256Digest({ fixture: "schema" }),
+    },
+    containers: {
+      hostedImageDigest,
+      hostedNpmArtifacts,
+      webImageDigest: sha256Digest({ fixture: "web" }),
+    },
+    migrations: {
+      bundleDigest: sha256Digest({ fixture: "migrations" }),
+      head: "20260820120000_freeze_advisory_priority.sql",
+    },
+    npm: npmArtifact,
+  };
+  const payload = {
+    schemaVersion: DEVELOPMENT_CANDIDATE_SCHEMA,
+    repository: SOURCE_REPOSITORY,
+    source,
+    artifacts,
+    qualification: {
+      source: structuredClone(source),
+      finishedAt: "2026-08-20T23:40:00.000Z",
+      receiptDigest: sha256Digest({ fixture: "qualification" }),
+      checks: [
+        "image-build",
+        "hosted-npm-artifact-parity",
+        "npm-pack",
+        "npm-clean-home-runtime-canary",
+        "pnpm-quality",
+        "pnpm-test",
+      ].map((id) => ({
+        id,
+        result: "passed",
+        evidenceDigest:
+          id === "npm-clean-home-runtime-canary"
+            ? runtimeCanaryDigest
+            : id === "hosted-npm-artifact-parity"
+              ? sha256Digest(hostedNpmArtifacts)
+              : sha256Digest({ fixture: id }),
+      })),
+    },
+    developmentDeployment: {
+      environmentId: "sift-q-development",
+      deploymentId: "dev-release:8",
+      source: structuredClone(source),
+      artifacts: structuredClone(artifacts),
+      deployedAt: "2026-08-20T23:45:00.000Z",
+      receiptDigest: sha256Digest({ fixture: "deployment" }),
+    },
+    developmentSmoke: {
+      environmentId: "sift-q-development",
+      observedDeploymentId: "dev-release:8",
+      observedSource: structuredClone(source),
+      observedArtifacts: structuredClone(artifacts),
+      result: "passed",
+      finishedAt: "2026-08-20T23:50:00.000Z",
+      receiptDigest: sha256Digest({ fixture: "smoke" }),
+    },
+    issuedAt: "2026-08-20T23:55:00.000Z",
+    expiresAt: "2026-08-21T00:55:00.000Z",
+  };
+  const signedCandidate = {
+    schemaVersion: SIGNED_DEVELOPMENT_CANDIDATE_SCHEMA,
+    keyId,
+    payload,
+    signatureBase64: sign(
+      null,
+      Buffer.from(canonicalJson(payload)),
+      privateKey,
+    ).toString("base64"),
+  };
+  return {
+    now,
+    receiptDigest: candidateReceiptDigest(signedCandidate),
+    signedCandidate,
+    signedRuntimeCanary,
+    trustPolicy,
+  };
 }
 
 test("verified handoff binds source, canary, package metadata and exact tarball bytes", async () => {
   const root = mkdtempSync(join(tmpdir(), "sift-q-relay-verifier-"));
   try {
-    const sourceRoot = join(root, "source");
-    const contractRoot = join(sourceRoot, "scripts", "ol");
     const candidateDirectory = join(root, "candidate");
     const packageRoot = join(root, "package");
-    mkdirSync(contractRoot, { recursive: true });
     mkdirSync(candidateDirectory);
     mkdirSync(packageRoot);
-    writeFileSync(
-      join(contractRoot, "candidate-contract.mjs"),
-      `
-      export const candidateReceiptDigest = (candidate) => candidate.receiptDigest;
-      export function validateDevelopmentCandidate({ signedCandidate, expectedSource }) {
-        if (JSON.stringify(signedCandidate.payload.source) !== JSON.stringify(expectedSource)) {
-          throw new Error("stub source differs");
-        }
-        return signedCandidate.payload;
-      }
-      `,
-    );
-    writeFileSync(
-      join(contractRoot, "npm-publisher-contract.mjs"),
-      `
-      export function validateSignedNpmRuntimeCanary({ signedRuntimeCanary, expectedPackage }) {
-        if (signedRuntimeCanary.ok !== true || expectedPackage.version !== "1.2.3") {
-          throw new Error("stub runtime canary differs");
-        }
-      }
-      `,
-    );
 
     assert.deepEqual(PACKAGE_REPOSITORY, {
       type: "git",
@@ -334,41 +523,17 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
     };
     const tarball = pack();
     const tarballDigest = digest(tarball);
-    const receiptDigest = `sha256:${"7".repeat(64)}`;
-    const runtimeDigest = `sha256:${"8".repeat(64)}`;
-    const candidate = {
-      receiptDigest,
-      payload: {
-        source: { ref: "refs/heads/main", sha: candidateSha, treeSha },
-        qualification: { finishedAt: "2026-08-21T00:00:00.000Z" },
-        artifacts: {
-          npm: {
-            packageName: "@sift-wiki/q",
-            version: "1.2.3",
-            tarballDigest,
-            runtimeCanaryReceiptDigest: runtimeDigest,
-          },
-        },
-      },
-    };
+    const fixture = signedCandidateFixture(tarball);
     writeFileSync(
       join(candidateDirectory, "signed-development-candidate.json"),
-      JSON.stringify(candidate),
+      JSON.stringify(fixture.signedCandidate),
     );
     writeFileSync(
       join(candidateDirectory, "signed-npm-runtime-canary.json"),
-      JSON.stringify({ ok: true }),
+      JSON.stringify(fixture.signedRuntimeCanary),
     );
     const trustPolicyPath = join(root, "trust.json");
-    writeFileSync(
-      trustPolicyPath,
-      JSON.stringify({
-        repository: SOURCE_REPOSITORY,
-        npmPackageName: "@sift-wiki/q",
-        developmentEnvironmentId: "sift-q-development",
-        productionEnvironmentId: "sift-q-production",
-      }),
-    );
+    writeFileSync(trustPolicyPath, JSON.stringify(fixture.trustPolicy));
     const selection = {
       sourceSha: candidateSha,
       treeSha,
@@ -378,12 +543,12 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
     };
 
     const verified = await verifyCandidate({
-      sourceRoot,
       candidateDirectory,
       trustPolicyPath,
       selection,
-      expectedReceiptDigest: receiptDigest,
+      expectedReceiptDigest: fixture.receiptDigest,
       expectedVersion: "1.2.3",
+      now: fixture.now,
     });
     assert.equal(verified.tarballDigest, tarballDigest);
     assert.equal(verified.sourceSha, candidateSha);
@@ -396,12 +561,12 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
     pack();
     await assert.rejects(
       verifyCandidate({
-        sourceRoot,
         candidateDirectory,
         trustPolicyPath,
         selection,
-        expectedReceiptDigest: receiptDigest,
+        expectedReceiptDigest: fixture.receiptDigest,
         expectedVersion: "1.2.3",
+        now: fixture.now,
       }),
       /npm tarball repository differs/,
     );
@@ -412,14 +577,32 @@ test("verified handoff binds source, canary, package metadata and exact tarball 
     pack();
     await assert.rejects(
       verifyCandidate({
-        sourceRoot,
         candidateDirectory,
         trustPolicyPath,
         selection,
-        expectedReceiptDigest: receiptDigest,
+        expectedReceiptDigest: fixture.receiptDigest,
         expectedVersion: "1.2.3",
+        now: fixture.now,
       }),
       /tarball bytes differ/,
+    );
+
+    const tampered = structuredClone(fixture.signedCandidate);
+    tampered.payload.issuedAt = "2026-08-20T23:54:59.000Z";
+    writeFileSync(
+      join(candidateDirectory, "signed-development-candidate.json"),
+      JSON.stringify(tampered),
+    );
+    await assert.rejects(
+      verifyCandidate({
+        candidateDirectory,
+        trustPolicyPath,
+        selection,
+        expectedReceiptDigest: candidateReceiptDigest(tampered),
+        expectedVersion: "1.2.3",
+        now: fixture.now,
+      }),
+      /development candidate signature is invalid/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
