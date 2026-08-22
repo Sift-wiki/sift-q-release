@@ -11,7 +11,7 @@
 #
 #   ops/break-glass.sh status      show the current reviewer rule
 #   ops/break-glass.sh open REASON lift the reviewer rule (REASON is recorded)
-#   ops/break-glass.sh close       restore the three reviewers + no self-review
+#   ops/break-glass.sh close       restore the two production owners + no self-review
 #
 # Both mutations are GitHub-audit-logged under the caller's account. A closed
 # glass is the default state; `close` is idempotent and safe to run any time.
@@ -20,11 +20,11 @@ set -euo pipefail
 REPO="Sift-wiki/sift-q-release"
 ENV_NAME="production"
 # The canonical reviewer set. Keep in sync with README.md "Break glass". This
-# is the FALLBACK only: `open` snapshots the live reviewer set first and
-# `close` restores that snapshot, so a stale list here cannot silently add or
-# drop a reviewer on close (a drill against a stale list would have re-added
-# a departed account and removed a current one).
-REVIEWERS=(Unobtainiumrock goodnight000 orange-juice-1024)
+# is the authority boundary: `open` snapshots the live reviewer set for audit,
+# but `close` always restores this owner-approved set. A stale or unauthorized
+# live reviewer must never become release authority merely by appearing in a
+# snapshot.
+REVIEWERS=(Unobtainiumrock orange-juice-1024)
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sift-q-release"
 SNAPSHOT="$LOG_DIR/reviewers.snapshot"
 
@@ -74,17 +74,16 @@ rr=[r for r in d.get("protection_rules",[]) if r["type"]=="required_reviewers"]
 print(" ".join(sorted(x["reviewer"]["login"] for x in rr[0]["reviewers"])) if rr else "")'
 }
 
-# The set `close` restores: the snapshot `open` took of the live rule, else
-# the canonical list. Warn when the two disagree — that is README drift.
+# `close` always restores the canonical owner-approved set. The snapshot is
+# evidence only; warn when it differs so authority drift remains visible.
 restore_set() {
-  local live
+  RESTORE=("${REVIEWERS[@]}")
   if [[ -s "$SNAPSHOT" ]]; then
-    read -r -a RESTORE <"$SNAPSHOT"
-  else
-    RESTORE=("${REVIEWERS[@]}")
-  fi
-  if ! same_set "${RESTORE[*]}" "${REVIEWERS[*]}"; then
-    echo "WARNING: restoring the snapshot {${RESTORE[*]}}, which differs from the canonical list {${REVIEWERS[*]}} in this script. Update REVIEWERS and README.md." >&2
+    local snapshot
+    snapshot=$(<"$SNAPSHOT")
+    if ! same_set "$snapshot" "${REVIEWERS[*]}"; then
+      echo "WARNING: snapshot {$snapshot} differs from owner-approved reviewers {${REVIEWERS[*]}}; restoring only the owner-approved set." >&2
+    fi
   fi
 }
 
@@ -97,7 +96,7 @@ reviewer_payload() {
 
 open_glass() {
   local reason="${1:-}"
-  [[ -n "$reason" ]] || { echo "open needs a REASON (it is recorded): ops/break-glass.sh open 'hotfix 0.9.8, goodnight000 unreachable'" >&2; exit 2; }
+  [[ -n "$reason" ]] || { echo "open needs a REASON (it is recorded): ops/break-glass.sh open 'hotfix 0.10.1, orange-juice-1024 unreachable'" >&2; exit 2; }
   echo "Lifting the reviewer rule on $REPO/$ENV_NAME. Branch policy, kill switch, guard, and OIDC stay in force."
   # Snapshot the LIVE reviewer set so close restores what was actually there.
   mkdir -p "$LOG_DIR"
