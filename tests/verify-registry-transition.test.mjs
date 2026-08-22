@@ -152,6 +152,7 @@ function inputs(
     candidateReceiptDigest: RECEIPT_DIGEST,
     latestBefore: "1.2.2",
     latestAfter: "1.2.2",
+    nextBefore: null,
     version: VERSION,
     nextTagVersion: VERSION,
     canary: validCanary(),
@@ -199,6 +200,7 @@ test("records exact registry bytes, a clean CLI canary, and an unsigned promotio
     assert.equal(result.evidence.registry.distTag, "next");
     assert.equal(result.evidence.registry.latestBefore, "1.2.2");
     assert.equal(result.evidence.registry.latestAfter, "1.2.2");
+    assert.equal(result.evidence.registry.nextBefore, null);
     assert.deepEqual(result.evidence.canary.dryRunPlan, [
       "fetch-hosted-content",
       "register-claude",
@@ -207,6 +209,8 @@ test("records exact registry bytes, a clean CLI canary, and an unsigned promotio
     assert.equal(result.binding.schemaVersion, LATEST_PROMOTION_BINDING_SCHEMA);
     assert.equal(result.binding.fromDistTag, "next");
     assert.equal(result.binding.toDistTag, "latest");
+    assert.equal(result.binding.expectedNextBefore, null);
+    assert.equal(result.binding.expectedNextVersion, VERSION);
     assert.equal(
       result.binding.transitionEvidenceDigest,
       result.transitionEvidenceDigest,
@@ -308,6 +312,22 @@ test("refuses a substituted next tag or registry digest metadata", () => {
     assert.throws(
       () => recordRegistryTransition(substitutedTag),
       /next tag does not select the candidate version/,
+    );
+
+    for (const nextBefore of ["1.2.1", "1.2.3", "1.3.0"]) {
+      const inFlight = inputs(root, tarball);
+      inFlight.nextBefore = nextBefore;
+      assert.throws(
+        () => recordRegistryTransition(inFlight),
+        /next precondition identifies a distinct in-flight candidate/,
+      );
+    }
+
+    const settled = inputs(root, tarball);
+    settled.nextBefore = settled.latestBefore;
+    assert.equal(
+      recordRegistryTransition(settled).evidence.registry.nextBefore,
+      settled.latestBefore,
     );
 
     const wrongDigest = inputs(root, tarball);

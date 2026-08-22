@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -105,6 +106,43 @@ test("the OIDC job has a separate production kill switch and no selection author
     publishJob,
     /candidate-selection|CANDIDATE_SELECTION_LANE|SIFT_Q_READ_TOKEN|DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON/,
   );
+});
+
+test("the actual pre-write tag parser accepts only absent or settled next", () => {
+  const match = publishJob.match(
+    /TAG_STATE=\$\(node --input-type=module - "\$VERSION" "\$DIST_TAGS" <<'NODE'\n([\s\S]*?)\n\s+NODE\n/,
+  );
+  assert.ok(match, "embedded dist-tag parser is present");
+  const program = match[1].replace(/^ {10}/gm, "");
+  const run = (tags) =>
+    spawnSync(process.execPath, ["--input-type=module", "-", "1.2.3", JSON.stringify(tags)], {
+      encoding: "utf8",
+      input: program,
+    });
+
+  for (const tags of [
+    { latest: "1.2.2" },
+    { latest: "1.2.2", next: "1.2.2" },
+  ]) {
+    const result = run(tags);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      latest: "1.2.2",
+      nextBefore: tags.next ?? null,
+    });
+  }
+
+  for (const next of ["1.2.1", "1.2.3", "1.3.0"]) {
+    const result = run({ latest: "1.2.2", next });
+    assert.notEqual(result.status, 0, `distinct next ${next} must refuse`);
+    assert.match(result.stderr, /in-flight candidate distinct from latest/);
+  }
+
+  const parserAt = publishJob.indexOf("DIST_TAGS=$(npm view");
+  const publishAt = publishJob.indexOf('npm publish "$PUBLISH_TARBALL"');
+  assert.ok(parserAt > 0 && publishAt > parserAt, "tag precondition precedes npm write");
+  assert.match(publishJob, /next_before: \$\{\{ steps\.registry_preflight\.outputs\.next_before \}\}/);
+  assert.match(verifyRegistryJob, /--next-before "\$NEXT_BEFORE"/);
 });
 
 test("every action is pinned to a 40-hex commit SHA", () => {
@@ -307,7 +345,7 @@ test("the OIDC write targets next and cannot move latest", () => {
   assert.doesNotMatch(publishJob, /npm dist-tag (?:add|rm)|--tag latest/);
   assert.match(
     publishJob,
-    /LATEST_BEFORE=\$\(npm view "\$PACKAGE" dist-tags\.latest\)/,
+    /DIST_TAGS=\$\(npm view "\$PACKAGE" dist-tags --json\)/,
   );
   assert.doesNotMatch(publishJob, /LATEST_AFTER=/);
   assert.match(
@@ -338,6 +376,7 @@ test("registry-served exact bytes are fetched canonically, canaried, and emitted
     "--registry-tarball",
     "--candidate-receipt-digest",
     "--next-tag-version",
+    "--next-before",
     "--output",
     "--promotion-binding-output",
   ]) {

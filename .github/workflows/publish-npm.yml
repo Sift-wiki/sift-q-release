@@ -275,6 +275,7 @@ jobs:
       id-token: write
     outputs:
       latest_before: ${{ steps.registry_preflight.outputs.latest_before }}
+      next_before: ${{ steps.registry_preflight.outputs.next_before }}
     env:
       NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
       NPM_CONFIG_USERCONFIG: /dev/null
@@ -331,13 +332,27 @@ jobs:
           }
           ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
           test "$ACTUAL" = "$EXPECTED_SHA256" || { echo "refusing: tarball changed after selection"; exit 1; }
-          LATEST_BEFORE=$(npm view "$PACKAGE" dist-tags.latest) || {
-            echo "refusing: cannot read the existing latest tag"
+          DIST_TAGS=$(npm view "$PACKAGE" dist-tags --json) || {
+            echo "refusing: cannot read the existing dist-tags"
             exit 1
           }
-          node -e '
-            if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.argv[1])) process.exit(1);
-          ' "$LATEST_BEFORE" || { echo "refusing: existing latest tag is invalid"; exit 1; }
+          TAG_STATE=$(node --input-type=module - "$VERSION" "$DIST_TAGS" <<'NODE'
+          const [candidate, encoded] = process.argv.slice(2);
+          const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+          let tags;
+          try { tags = JSON.parse(encoded); } catch { throw new Error("refusing: dist-tags response is not JSON"); }
+          if (tags === null || typeof tags !== "object" || Array.isArray(tags) || !stable.test(tags.latest ?? "")) {
+            throw new Error("refusing: existing latest tag is invalid");
+          }
+          if (Object.hasOwn(tags, "next") && (!stable.test(tags.next) || tags.next !== tags.latest)) {
+            throw new Error("refusing: next identifies an in-flight candidate distinct from latest");
+          }
+          if (!stable.test(candidate)) throw new Error("refusing: candidate version is invalid");
+          process.stdout.write(JSON.stringify({ latest: tags.latest, nextBefore: tags.next ?? null }));
+          NODE
+          ) || exit 1
+          LATEST_BEFORE=$(node -p 'require("node:process").argv[1] && JSON.parse(require("node:process").argv[1]).latest' "$TAG_STATE")
+          NEXT_BEFORE=$(node -p 'const value=JSON.parse(require("node:process").argv[1]).nextBefore; value === null ? "absent" : value' "$TAG_STATE")
           node -e '
             const parse = value => value.split(".").map(BigInt);
             const [candidate, latest] = process.argv.slice(1).map(parse);
@@ -366,7 +381,9 @@ jobs:
           }
           echo "PUBLISH_TARBALL=$TARBALL" >>"$GITHUB_ENV"
           echo "LATEST_BEFORE=$LATEST_BEFORE" >>"$GITHUB_ENV"
+          echo "NEXT_BEFORE=$NEXT_BEFORE" >>"$GITHUB_ENV"
           echo "latest_before=$LATEST_BEFORE" >>"$GITHUB_OUTPUT"
+          echo "next_before=$NEXT_BEFORE" >>"$GITHUB_OUTPUT"
 
       - name: publish the exact candidate to next with OIDC trusted publishing
         env:
@@ -419,6 +436,7 @@ jobs:
           CANDIDATE_RUN_ID: ${{ needs.select.outputs.run_id }}
           EXPECTED_SHA256: ${{ needs.select.outputs.tarball_sha256 }}
           LATEST_BEFORE: ${{ needs.publish.outputs.latest_before }}
+          NEXT_BEFORE: ${{ needs.publish.outputs.next_before }}
           SOURCE_SHA: ${{ needs.select.outputs.source_sha }}
           TREE_SHA: ${{ needs.select.outputs.tree_sha }}
           VERSION: ${{ needs.select.outputs.version }}
@@ -506,6 +524,7 @@ jobs:
             --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
             --candidate-receipt-digest "$CANDIDATE_RECEIPT_DIGEST" \
             --latest-before "$LATEST_BEFORE" --latest-after "$LATEST_AFTER_CANARY" \
+            --next-before "$NEXT_BEFORE" \
             --version "$VERSION" --next-tag-version "$NEXT_AFTER_CANARY" \
             --output "$TRANSITION_DIR/npm-next-transition.json" \
             --promotion-binding-output "$TRANSITION_DIR/npm-latest-promotion-binding.json" \

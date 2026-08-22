@@ -441,6 +441,7 @@ export function validateNextTransitionEvidence(value) {
       "integrity",
       "latestAfter",
       "latestBefore",
+      "nextBefore",
       "registry",
       "shasum",
       "tarballUrl",
@@ -453,6 +454,8 @@ export function validateNextTransitionEvidence(value) {
       value.registry.distTagVersion === value.package.version &&
       value.registry.latestBefore === value.registry.latestAfter &&
       STABLE_VERSION.test(value.registry.latestBefore) &&
+      (value.registry.nextBefore === null ||
+        value.registry.nextBefore === value.registry.latestBefore) &&
       SHA512_INTEGRITY.test(value.registry.integrity ?? "") &&
       SHA1.test(value.registry.shasum),
     "transition registry state differs",
@@ -518,6 +521,7 @@ export function promotionBindingFor(evidence) {
     fromDistTag: "next",
     toDistTag: "latest",
     expectedLatestBefore: evidence.registry.latestBefore,
+    expectedNextBefore: evidence.registry.nextBefore,
     expectedNextVersion: evidence.package.version,
   };
 }
@@ -528,6 +532,7 @@ export function validatePromotionBinding(binding, evidence) {
     [
       "candidateReceiptDigest",
       "expectedLatestBefore",
+      "expectedNextBefore",
       "expectedNextVersion",
       "fromDistTag",
       "packageName",
@@ -807,6 +812,7 @@ export function recordRegistryTransition({
   candidateReceiptDigest,
   latestBefore,
   latestAfter,
+  nextBefore,
   version,
   nextTagVersion,
   canary,
@@ -838,6 +844,10 @@ export function recordRegistryTransition({
   invariant(
     STABLE_VERSION.test(latestBefore) && latestAfter === latestBefore,
     "latest changed during next publication",
+  );
+  invariant(
+    nextBefore === null || nextBefore === latestBefore,
+    "next precondition identifies a distinct in-flight candidate",
   );
   invariant(
     compareStableVersions(version, latestBefore) > 0,
@@ -891,6 +901,7 @@ export function recordRegistryTransition({
       integrity: registryMetadata.integrity,
       latestAfter,
       latestBefore,
+      nextBefore,
       registry: CANONICAL_REGISTRY,
       shasum: registryMetadata.shasum,
       tarballUrl: registryMetadata.tarballUrl,
@@ -959,6 +970,7 @@ async function main(argv) {
       "--canary",
       "--latest-after",
       "--latest-before",
+      "--next-before",
       "--next-tag-version",
       "--output",
       "--promotion-binding-output",
@@ -987,6 +999,10 @@ async function main(argv) {
       candidateReceiptDigest: required(values, "--candidate-receipt-digest"),
       latestBefore: required(values, "--latest-before"),
       latestAfter: required(values, "--latest-after"),
+      nextBefore:
+        required(values, "--next-before") === "absent"
+          ? null
+          : required(values, "--next-before"),
       version: required(values, "--version"),
       nextTagVersion: required(values, "--next-tag-version"),
       canary: jsonFile(required(values, "--canary"), "registry canary"),

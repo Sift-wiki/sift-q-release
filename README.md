@@ -25,9 +25,10 @@ repository's GitHub-hosted jobs are unavailable.
    does not install, build, pack, or execute candidate code.
 4. One of those two production owners dispatches again with the same run ID and
    receipt digest and `dry_run=false`. The OIDC job receives only the verified
-   tarball, rechecks its digest and registry absence, and publishes those exact
-   bytes under the `next` dist-tag. It has no private-repository credential or
-   private checkout.
+   tarball, rechecks its digest and registry absence, and refuses to write if
+   `next` identifies any in-flight version distinct from `latest`. It then
+   publishes those exact bytes under the `next` dist-tag. It has no
+   private-repository credential or private checkout.
 5. A separate no-OIDC, no-secret, no-write job fetches that exact version back
    through the canonical npm registry, proves the registry tarball is
    byte-identical to the selected candidate, installs those registry-served
@@ -103,7 +104,8 @@ This repository is the trust root of the npm lane:
 `--tag latest`. Its evidence artifact contains:
 
 - `npm-next-transition.json`: exact source, candidate receipt, tarball digest,
-  canonical registry metadata, unchanged `latest`, and clean canary result.
+  canonical registry metadata, the pre-write `next` state, unchanged `latest`,
+  and clean canary result. `next` must have been absent or equal to `latest`.
 - `npm-latest-promotion-binding.json`: the exact payload a signed promotion
   authorization must bind, including the transition-evidence digest,
   source/tree SHAs, candidate receipt digest, tarball digest, version, and the
@@ -115,6 +117,17 @@ authorization before the owner runs the 2FA command. After the tag moves,
 evidence, proves the exact public bytes and tag state, rejects a reused
 authorization ID, and records both the signed authorization and a strict
 read-only verification result.
+
+The post-state result JSON is intentionally not signed by a GitHub-held key.
+The archived owner-signed Ed25519 authorization covers the exact transition
+evidence digest and promotion preconditions; its canonical SHA-256 digest is
+embedded in the result. The result's own digest is recorded in the GitHub run
+summary, and its provenance is the immutable GitHub run and artifact. External
+verification therefore checks the owner signature and both canonical digests,
+then relies on GitHub for the run/artifact provenance. This avoids placing a
+long-lived owner signing secret in GitHub. The owner signature does not cover
+the post-state result, and that result must not be described as independently
+signed.
 
 The final mutation is intentionally human and exact:
 
