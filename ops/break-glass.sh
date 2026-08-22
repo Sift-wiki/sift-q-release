@@ -24,7 +24,7 @@ ENV_NAME="production"
 # but `close` always restores this owner-approved set. A stale or unauthorized
 # live reviewer must never become release authority merely by appearing in a
 # snapshot.
-REVIEWERS=(Unobtainiumrock goodnight000)
+REVIEWERS=(Unobtainiumrock orange-juice-1024)
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sift-q-release"
 SNAPSHOT="$LOG_DIR/reviewers.snapshot"
 
@@ -96,7 +96,7 @@ reviewer_payload() {
 
 open_glass() {
   local reason="${1:-}"
-  [[ -n "$reason" ]] || { echo "open needs a REASON (it is recorded): ops/break-glass.sh open 'hotfix 0.9.8, goodnight000 unreachable'" >&2; exit 2; }
+  [[ -n "$reason" ]] || { echo "open needs a REASON (it is recorded): ops/break-glass.sh open 'hotfix 0.10.1, orange-juice-1024 unreachable'" >&2; exit 2; }
   echo "Lifting the reviewer rule on $REPO/$ENV_NAME. Branch policy, kill switch, guard, and OIDC stay in force."
   # Snapshot the LIVE reviewer set so close restores what was actually there.
   mkdir -p "$LOG_DIR"

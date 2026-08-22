@@ -34,9 +34,13 @@ export const SIGNED_LATEST_PROMOTION_SCHEMA =
   "sift-q-npm-latest-promotion-receipt/v1";
 export const LATEST_PROMOTION_TRUST_SCHEMA =
   "sift-q-npm-latest-promotion-trust/v1";
+export const LATEST_PROMOTION_RESULT_SCHEMA =
+  "sift-q-npm-latest-promotion-verification/v1";
 export const PACKAGE_NAME = "@sift-wiki/q";
 export const SOURCE_REPOSITORY = "Sift-wiki/sift-q-refactor";
+export const RELEASE_REPOSITORY = "Sift-wiki/sift-q-release";
 export const CANONICAL_REGISTRY = "https://registry.npmjs.org/";
+export const PRODUCTION_ACTORS = ["Unobtainiumrock", "orange-juice-1024"];
 
 const SHA = /^[0-9a-f]{40}$/;
 const SHA1 = /^[0-9a-f]{40}$/;
@@ -562,6 +566,7 @@ export function verifySignedPromotionReceipt({
   evidence,
   currentLatest,
   currentNext,
+  promotionComplete = false,
   now = () => new Date(),
 }) {
   exactKeys(
@@ -675,14 +680,120 @@ export function verifySignedPromotionReceipt({
   );
   const binding = validatePromotionBinding(receipt.binding, evidence);
   invariant(
-    currentLatest === binding.expectedLatestBefore,
-    "current latest differs from the signed promotion precondition",
+    currentLatest ===
+      (promotionComplete ? binding.version : binding.expectedLatestBefore),
+    promotionComplete
+      ? "current latest does not select the signed promoted version"
+      : "current latest differs from the signed promotion precondition",
   );
   invariant(
     currentNext === binding.expectedNextVersion,
     "current next differs from the signed promotion precondition",
   );
   return { authorizationId: receipt.authorizationId, binding };
+}
+
+export function verifyCompletedPromotion({
+  receipt,
+  trustPolicy,
+  evidence,
+  currentLatest,
+  currentNext,
+  registryMetadata,
+  registryTarballPath,
+  actor,
+  triggeringActor,
+  releaseRepository,
+  releaseSha,
+  workflowRunId,
+  workflowRunAttempt,
+  transitionRunId,
+  outputPath,
+  now = () => new Date(),
+}) {
+  invariant(PRODUCTION_ACTORS.includes(actor), "promotion actor is not a production owner");
+  invariant(
+    PRODUCTION_ACTORS.includes(triggeringActor),
+    "promotion triggering actor is not a production owner",
+  );
+  invariant(
+    releaseRepository === RELEASE_REPOSITORY && SHA.test(releaseSha),
+    "promotion release identity differs",
+  );
+  for (const [value, label] of [
+    [workflowRunId, "promotion workflow run id"],
+    [workflowRunAttempt, "promotion workflow run attempt"],
+    [transitionRunId, "promotion transition run id"],
+  ]) {
+    invariant(Number.isSafeInteger(value) && value > 0, `${label} is invalid`);
+  }
+  const verified = verifySignedPromotionReceipt({
+    receipt,
+    trustPolicy,
+    evidence,
+    currentLatest,
+    currentNext,
+    promotionComplete: true,
+    now,
+  });
+  regularFile(registryTarballPath, "promoted registry tarball");
+  const bytes = readFileSync(resolve(registryTarballPath));
+  const metadata = validateRegistryMetadata(
+    registryMetadata,
+    verified.binding.version,
+  );
+  invariant(
+    sha256(bytes) === verified.binding.tarballDigest,
+    "promoted registry tarball digest differs",
+  );
+  invariant(
+    sha1(bytes) === metadata.shasum &&
+      sha512Integrity(bytes) === metadata.integrity,
+    "promoted registry digest metadata differs",
+  );
+  invariant(
+    metadata.shasum === evidence.registry.shasum &&
+      metadata.integrity === evidence.registry.integrity &&
+      metadata.tarballUrl === evidence.registry.tarballUrl,
+    "promoted registry metadata differs from the canaried transition",
+  );
+  const verifiedAt = now().toISOString();
+  instant(verifiedAt, "promotion verifiedAt");
+  const signedAuthorizationDigest = sha256(canonicalJson(receipt));
+  const result = {
+    schemaVersion: LATEST_PROMOTION_RESULT_SCHEMA,
+    authority: "read-only-post-promotion-verification",
+    authorizationId: verified.authorizationId,
+    actor,
+    triggeringActor,
+    verifiedAt,
+    release: {
+      repository: releaseRepository,
+      sha: releaseSha,
+      workflowRunId,
+      workflowRunAttempt,
+    },
+    transition: {
+      runId: transitionRunId,
+      evidenceDigest: verified.binding.transitionEvidenceDigest,
+    },
+    package: {
+      name: PACKAGE_NAME,
+      version: verified.binding.version,
+      tarballDigest: verified.binding.tarballDigest,
+      shasum: metadata.shasum,
+      integrity: metadata.integrity,
+    },
+    registry: {
+      registry: CANONICAL_REGISTRY,
+      next: currentNext,
+      latest: currentLatest,
+      tarballUrl: metadata.tarballUrl,
+    },
+    signedAuthorizationDigest,
+  };
+  const receiptDigest = writeExclusive(outputPath, result);
+  return { receiptDigest, result };
 }
 
 export function recordRegistryTransition({
@@ -935,6 +1046,49 @@ async function main(argv) {
     });
     process.stdout.write(
       `${JSON.stringify({ authorizationId: verified.authorizationId, transitionEvidenceDigest: verified.binding.transitionEvidenceDigest })}\n`,
+    );
+    return;
+  }
+  if (command === "verify-promotion-result") {
+    const values = argumentsOf(
+      rest,
+      new Set([
+        "--actor",
+        "--current-latest",
+        "--current-next",
+        "--evidence",
+        "--output",
+        "--receipt",
+        "--registry-metadata",
+        "--registry-tarball",
+        "--release-repository",
+        "--release-sha",
+        "--transition-run-id",
+        "--triggering-actor",
+        "--trust-policy",
+        "--workflow-run-attempt",
+        "--workflow-run-id",
+      ]),
+    );
+    const output = verifyCompletedPromotion({
+      receipt: jsonFile(required(values, "--receipt"), "signed promotion receipt"),
+      trustPolicy: jsonFile(required(values, "--trust-policy"), "promotion trust policy"),
+      evidence: jsonFile(required(values, "--evidence"), "transition evidence"),
+      currentLatest: required(values, "--current-latest"),
+      currentNext: required(values, "--current-next"),
+      registryMetadata: jsonFile(required(values, "--registry-metadata"), "registry metadata"),
+      registryTarballPath: required(values, "--registry-tarball"),
+      actor: required(values, "--actor"),
+      triggeringActor: required(values, "--triggering-actor"),
+      releaseRepository: required(values, "--release-repository"),
+      releaseSha: required(values, "--release-sha"),
+      workflowRunId: positiveInteger(required(values, "--workflow-run-id"), "promotion workflow run id"),
+      workflowRunAttempt: positiveInteger(required(values, "--workflow-run-attempt"), "promotion workflow run attempt"),
+      transitionRunId: positiveInteger(required(values, "--transition-run-id"), "promotion transition run id"),
+      outputPath: required(values, "--output"),
+    });
+    process.stdout.write(
+      `${JSON.stringify({ authorizationId: output.result.authorizationId, receiptDigest: output.receiptDigest })}\n`,
     );
     return;
   }

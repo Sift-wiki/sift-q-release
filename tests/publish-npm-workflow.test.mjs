@@ -64,7 +64,11 @@ test("all jobs are GitHub-hosted; selection and publishing use separate protecte
   assert.match(selectJob, /environment: candidate-selection/);
   assert.match(publishJob, /environment: production/);
   assert.doesNotMatch(lintJob, /environment:/);
-  assert.match(selectJob, /if: github\.ref == 'refs\/heads\/main'/);
+  assert.match(selectJob, /github\.ref == 'refs\/heads\/main'/);
+  assert.match(selectJob, /Unobtainiumrock\|orange-juice-1024/);
+  assert.match(selectJob, /GITHUB_TRIGGERING_ACTOR/);
+  assert.match(selectJob, /is not a production\/npm owner/);
+  assert.doesNotMatch(selectJob, /goodnight000\)/);
   assert.match(publishJob, /needs: select/);
   assert.match(publishJob, /if: \$\{\{ !inputs\.dry_run \}\}/);
 });
@@ -77,6 +81,9 @@ test("the environment kill switch is the first select step", () => {
     firstStep,
     /CANDIDATE_SELECTION_LANE: \$\{\{ vars\.CANDIDATE_SELECTION_LANE \}\}/,
   );
+  assert.match(firstStep, /Unobtainiumrock\|orange-juice-1024/);
+  assert.match(firstStep, /GITHUB_TRIGGERING_ACTOR/);
+  assert.match(firstStep, /is not a production\/npm owner/);
   assert.match(firstStep, /!= "exact-development-candidate"/);
   assert.doesNotMatch(firstStep, /actions\/checkout|SIFT_Q_READ_TOKEN/);
 });
@@ -89,6 +96,10 @@ test("the OIDC job has a separate production kill switch and no selection author
     firstStep,
     /NPM_PUBLISHER_LANE: \$\{\{ vars\.NPM_PUBLISHER_LANE \}\}/,
   );
+  assert.match(firstStep, /Unobtainiumrock\|orange-juice-1024/);
+  assert.match(firstStep, /GITHUB_TRIGGERING_ACTOR/);
+  assert.match(firstStep, /is not a production\/npm owner/);
+  assert.doesNotMatch(firstStep, /goodnight000\)/);
   assert.match(firstStep, /!= "github-actions-oidc"/);
   assert.doesNotMatch(
     publishJob,

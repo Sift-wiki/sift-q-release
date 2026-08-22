@@ -1,0 +1,218 @@
+name: verify-npm-latest-promotion
+
+# Read-only verifier for the interactive next -> latest promotion. The exact
+# package was already published and canaried on next. Nicholas or Charles moves
+# only the dist-tag with npm 2FA, then dispatches this workflow. It cannot mint
+# an npm OIDC token and contains no registry-write credential.
+on:
+  workflow_dispatch:
+    inputs:
+      transition_run_id:
+        description: Successful publish-npm run that emitted the next-transition evidence.
+        type: string
+        required: true
+      transition_evidence_digest:
+        description: Exact sha256 digest of npm-next-transition.json.
+        type: string
+        required: true
+      signed_promotion_receipt_base64:
+        description: Base64 of the short-lived signed next-to-latest authorization.
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  PACKAGE: "@sift-wiki/q"
+  NPM_VERSION: 11.19.0
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  NPM_CONFIG_USERCONFIG: /dev/null
+
+jobs:
+  verify:
+    name: verify exact interactive latest promotion
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: refuse unless read-only latest verification is switched on
+        env:
+          NPM_LATEST_PROMOTION_VERIFIER_LANE: ${{ vars.NPM_LATEST_PROMOTION_VERIFIER_LANE }}
+        run: |
+          set -euo pipefail
+          for actor in "$GITHUB_ACTOR" "$GITHUB_TRIGGERING_ACTOR"; do
+            case "$actor" in
+              Unobtainiumrock|orange-juice-1024) ;;
+              *) echo "refusing: $actor is not a production/npm owner"; exit 1 ;;
+            esac
+          done
+          test "${NPM_LATEST_PROMOTION_VERIFIER_LANE:-}" = "signed-next-to-latest-v1" || {
+            echo "refusing: latest promotion verifier lane is off"
+            exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: install the exact read-only npm client
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/npm-pinned"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "npm@$NPM_VERSION"
+          echo "$prefix/bin" >>"$GITHUB_PATH"
+          test "$("$prefix/bin/npm" --version)" = "$NPM_VERSION"
+
+      - name: select exact current-main next-transition evidence
+        id: transition
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSITION_EVIDENCE_DIGEST: ${{ inputs.transition_evidence_digest }}
+          TRANSITION_RUN_ID: ${{ inputs.transition_run_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$TRANSITION_RUN_ID" in ''|*[!0-9]*|0*) echo "refusing: invalid transition run ID"; exit 1;; esac
+          case "$TRANSITION_EVIDENCE_DIGEST" in sha256:[0-9a-f][0-9a-f]*) ;; *) echo "refusing: invalid transition evidence digest"; exit 1;; esac
+          test "${#TRANSITION_EVIDENCE_DIGEST}" -eq 71 || { echo "refusing: invalid transition evidence digest"; exit 1; }
+          BOUNDARY=$(mktemp -d "$RUNNER_TEMP/latest-promotion.XXXXXX")
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$TRANSITION_RUN_ID" >"$BOUNDARY/run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$TRANSITION_RUN_ID/artifacts?per_page=100" >"$BOUNDARY/artifacts.json"
+          node --input-type=module - "$BOUNDARY/run.json" "$BOUNDARY/artifacts.json" "$TRANSITION_RUN_ID" "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$BOUNDARY/selection.json" <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const [runFile, artifactsFile, expectedRunId, expectedSha, expectedRepository, output] = process.argv.slice(2);
+          const run = JSON.parse(readFileSync(runFile, "utf8"));
+          const artifacts = JSON.parse(readFileSync(artifactsFile, "utf8"));
+          const refuse = (condition, message) => { if (!condition) throw new Error(`refusing: ${message}`); };
+          refuse(String(run.id) === expectedRunId, "transition run ID differs");
+          refuse(run.name === "publish-npm", "transition workflow name differs");
+          refuse(run.path === ".github/workflows/publish-npm.yml", "transition workflow path differs");
+          refuse(run.event === "workflow_dispatch", "transition workflow event differs");
+          refuse(run.head_branch === "main" && run.head_sha === expectedSha, "transition is not exact current release main");
+          refuse(run.status === "completed" && run.conclusion === "success", "transition run did not succeed");
+          refuse(run.repository?.full_name === expectedRepository, "transition repository differs");
+          refuse(Array.isArray(artifacts.artifacts), "transition artifacts response is invalid");
+          const matches = artifacts.artifacts.filter((artifact) =>
+            /^npm-next-transition-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(artifact.name ?? ""),
+          );
+          refuse(matches.length === 1, "expected exactly one next-transition artifact");
+          const artifact = matches[0];
+          refuse(artifact.expired === false && artifact.size_in_bytes > 0, "next-transition artifact is unavailable");
+          refuse(artifact.workflow_run?.id === run.id, "next-transition artifact run differs");
+          writeFileSync(output, `${JSON.stringify({ artifactId: artifact.id, artifactName: artifact.name, releaseSha: run.head_sha })}\n`, { flag: "wx" });
+          NODE
+          ARTIFACT_ID=$(node -p 'require(process.argv[1]).artifactId' "$BOUNDARY/selection.json")
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" >"$BOUNDARY/transition.zip"
+          EXPECTED=$(printf '%s\n' npm-latest-promotion-binding.json npm-next-transition.json | sort)
+          ACTUAL=$(unzip -Z1 "$BOUNDARY/transition.zip" | sort)
+          test "$ACTUAL" = "$EXPECTED" || { echo "refusing: transition artifact file set differs"; exit 1; }
+          unzip -q "$BOUNDARY/transition.zip" -d "$BOUNDARY/transition"
+          ACTUAL_DIGEST="sha256:$(sha256sum "$BOUNDARY/transition/npm-next-transition.json" | cut -d' ' -f1)"
+          test "$ACTUAL_DIGEST" = "$TRANSITION_EVIDENCE_DIGEST" || { echo "refusing: transition evidence digest differs"; exit 1; }
+          node scripts/verify-registry-transition.mjs verify-promotion-binding \
+            --evidence "$BOUNDARY/transition/npm-next-transition.json" \
+            --binding "$BOUNDARY/transition/npm-latest-promotion-binding.json"
+          echo "boundary=$BOUNDARY" >>"$GITHUB_OUTPUT"
+
+      - name: verify owner signature, promoted tags, and exact registry bytes
+        id: verified
+        env:
+          BOUNDARY: ${{ steps.transition.outputs.boundary }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER_TRUST_POLICY_JSON: ${{ secrets.NPM_LATEST_PROMOTION_TRUST_POLICY_JSON }}
+          SIGNED_PROMOTION_RECEIPT_BASE64: ${{ inputs.signed_promotion_receipt_base64 }}
+          TRANSITION_RUN_ID: ${{ inputs.transition_run_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${OWNER_TRUST_POLICY_JSON:-}" || { echo "refusing: latest promotion trust policy is missing"; exit 1; }
+          printf '%s' "$OWNER_TRUST_POLICY_JSON" >"$BOUNDARY/trust-policy.json"
+          printf '%s' "$SIGNED_PROMOTION_RECEIPT_BASE64" | base64 --decode >"$BOUNDARY/signed-promotion.json" || {
+            echo "refusing: signed promotion receipt is not valid base64"
+            exit 1
+          }
+          VERSION=$(node -p 'require(process.argv[1]).package.version' "$BOUNDARY/transition/npm-next-transition.json")
+          NEXT=$(npm view "$PACKAGE" dist-tags.next) || { echo "refusing: cannot read next"; exit 1; }
+          LATEST=$(npm view "$PACKAGE" dist-tags.latest) || { echo "refusing: cannot read latest"; exit 1; }
+          npm view "$PACKAGE@$VERSION" --json >"$BOUNDARY/registry-metadata.json" || {
+            echo "refusing: promoted version is not public"
+            exit 1
+          }
+          TARBALL_URL=$(node --input-type=module - "$BOUNDARY/registry-metadata.json" "$VERSION" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          const version = process.argv[3];
+          const url = new URL(metadata.dist?.tarball ?? "");
+          if (url.protocol !== "https:" || url.hostname !== "registry.npmjs.org" || url.port || url.username || url.password || url.search || url.hash || url.pathname !== `/@sift-wiki/q/-/q-${version}.tgz`) {
+            throw new Error("refusing: promoted registry tarball URL is not canonical");
+          }
+          process.stdout.write(url.href);
+          NODE
+          )
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            "$TARBALL_URL" --output "$BOUNDARY/registry-package.tgz"
+          mkdir -p "$RUNNER_TEMP/latest-verification"
+          RESULT=$(node scripts/verify-registry-transition.mjs verify-promotion-result \
+            --receipt "$BOUNDARY/signed-promotion.json" \
+            --trust-policy "$BOUNDARY/trust-policy.json" \
+            --evidence "$BOUNDARY/transition/npm-next-transition.json" \
+            --current-latest "$LATEST" --current-next "$NEXT" \
+            --registry-metadata "$BOUNDARY/registry-metadata.json" \
+            --registry-tarball "$BOUNDARY/registry-package.tgz" \
+            --actor "$GITHUB_ACTOR" --triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --release-repository "$GITHUB_REPOSITORY" \
+            --release-sha "$GITHUB_SHA" --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --transition-run-id "$TRANSITION_RUN_ID" \
+            --output "$RUNNER_TEMP/latest-verification/npm-latest-verification.json")
+          AUTHORIZATION_ID=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).authorizationId)' "$RESULT")
+          RECEIPT_DIGEST=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).receiptDigest)' "$RESULT")
+          ARTIFACT_NAME="npm-latest-verification-$AUTHORIZATION_ID"
+          test "$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq ".artifacts[]|select(.name==\"$ARTIFACT_NAME\")|.id" | wc -l)" -eq 0 || {
+            echo "refusing: signed promotion authorization was already consumed"
+            exit 1
+          }
+          cp "$BOUNDARY/signed-promotion.json" "$RUNNER_TEMP/latest-verification/signed-npm-latest-promotion.json"
+          echo "artifact_name=$ARTIFACT_NAME" >>"$GITHUB_OUTPUT"
+          echo "authorization_id=$AUTHORIZATION_ID" >>"$GITHUB_OUTPUT"
+          echo "receipt_digest=$RECEIPT_DIGEST" >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.verified.outputs.artifact_name }}
+          path: ${{ runner.temp }}/latest-verification/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: record verified latest promotion
+        env:
+          AUTHORIZATION_ID: ${{ steps.verified.outputs.authorization_id }}
+          RECEIPT_DIGEST: ${{ steps.verified.outputs.receipt_digest }}
+          VERSION: ${{ steps.verified.outputs.version }}
+        run: |
+          {
+            echo "## verified interactive npm latest promotion"
+            echo
+            echo "- package: $PACKAGE@$VERSION"
+            echo "- next and latest: $VERSION"
+            echo "- dispatcher: $GITHUB_ACTOR"
+            echo "- rerun actor: $GITHUB_TRIGGERING_ACTOR"
+            echo "- signed authorization: $AUTHORIZATION_ID"
+            echo "- read-only verification receipt: $RECEIPT_DIGEST"
+          } >>"$GITHUB_STEP_SUMMARY"

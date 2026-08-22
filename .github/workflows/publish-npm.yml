@@ -82,6 +82,12 @@ jobs:
           CANDIDATE_SELECTION_LANE: ${{ vars.CANDIDATE_SELECTION_LANE }}
         run: |
           set -euo pipefail
+          for actor in "$GITHUB_ACTOR" "$GITHUB_TRIGGERING_ACTOR"; do
+            case "$actor" in
+              Unobtainiumrock|orange-juice-1024) ;;
+              *) echo "refusing: $actor is not a production/npm owner"; exit 1 ;;
+            esac
+          done
           if [ "${CANDIDATE_SELECTION_LANE:-}" != "exact-development-candidate" ]; then
             echo "refusing: candidate-selection CANDIDATE_SELECTION_LANE is not exact-development-candidate"
             exit 1
@@ -278,6 +284,12 @@ jobs:
           NPM_PUBLISHER_LANE: ${{ vars.NPM_PUBLISHER_LANE }}
         run: |
           set -euo pipefail
+          for actor in "$GITHUB_ACTOR" "$GITHUB_TRIGGERING_ACTOR"; do
+            case "$actor" in
+              Unobtainiumrock|orange-juice-1024) ;;
+              *) echo "refusing: $actor is not a production/npm owner"; exit 1 ;;
+            esac
+          done
           if [ "${NPM_PUBLISHER_LANE:-}" != "github-actions-oidc" ]; then
             echo "refusing: production NPM_PUBLISHER_LANE is not github-actions-oidc"
             exit 1

@@ -19,6 +19,7 @@ import test from "node:test";
 import {
   CANONICAL_REGISTRY,
   LATEST_PROMOTION_BINDING_SCHEMA,
+  LATEST_PROMOTION_RESULT_SCHEMA,
   LATEST_PROMOTION_TRUST_SCHEMA,
   NEXT_TRANSITION_SCHEMA,
   SIGNED_LATEST_PROMOTION_SCHEMA,
@@ -28,6 +29,7 @@ import {
   runRegistryCanary,
   validateNextTransitionEvidence,
   validatePromotionBinding,
+  verifyCompletedPromotion,
   verifySignedPromotionReceipt,
 } from "../scripts/verify-registry-transition.mjs";
 
@@ -595,6 +597,122 @@ test("promotion trust rejects duplicate key material and key-id substitution", (
           },
         }),
       /signer is not trusted/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("read-only promotion verification binds owner, exact tags, release main, and registry bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "sift-q-registry-transition-"));
+  try {
+    const tarball = makePackage(root);
+    const { evidence, binding } = recordRegistryTransition(
+      inputs(root, tarball),
+    );
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const receipt = signedReceipt(binding, privateKey);
+    const trustPolicy = {
+      schemaVersion: LATEST_PROMOTION_TRUST_SCHEMA,
+      keys: [
+        {
+          algorithm: "Ed25519",
+          keyId: receipt.keyId,
+          publicKeyPem: publicKey.export({ format: "pem", type: "spki" }),
+        },
+      ],
+    };
+    const base = {
+      receipt,
+      trustPolicy,
+      evidence,
+      currentLatest: VERSION,
+      currentNext: VERSION,
+      registryMetadata: metadata(tarball),
+      registryTarballPath: tarball,
+      actor: "Unobtainiumrock",
+      triggeringActor: "Unobtainiumrock",
+      releaseRepository: "Sift-wiki/sift-q-release",
+      releaseSha: "4".repeat(40),
+      workflowRunId: 101,
+      workflowRunAttempt: 1,
+      transitionRunId: 99,
+      outputPath: join(root, "promotion-result.json"),
+      now: VERIFY_NOW,
+    };
+    const verified = verifyCompletedPromotion(base);
+    assert.equal(
+      verified.result.schemaVersion,
+      LATEST_PROMOTION_RESULT_SCHEMA,
+    );
+    assert.equal(
+      verified.result.authority,
+      "read-only-post-promotion-verification",
+    );
+    assert.equal(verified.result.registry.next, VERSION);
+    assert.equal(verified.result.registry.latest, VERSION);
+    assert.equal(verified.result.release.sha, "4".repeat(40));
+    assert.equal(verified.result.actor, "Unobtainiumrock");
+    assert.equal(verified.result.triggeringActor, "Unobtainiumrock");
+    assert.match(verified.receiptDigest, /^sha256:[0-9a-f]{64}$/);
+
+    for (const actor of ["goodnight000", "siftwiki", "unknown"])
+      assert.throws(
+        () =>
+          verifyCompletedPromotion({
+            ...base,
+            actor,
+            outputPath: join(root, `actor-${actor}.json`),
+          }),
+        /actor is not a production owner/,
+      );
+    for (const triggeringActor of ["goodnight000", "siftwiki", "unknown"])
+      assert.throws(
+        () =>
+          verifyCompletedPromotion({
+            ...base,
+            triggeringActor,
+            outputPath: join(root, `triggering-actor-${triggeringActor}.json`),
+          }),
+        /triggering actor is not a production owner/,
+      );
+    assert.throws(
+      () =>
+        verifyCompletedPromotion({
+          ...base,
+          currentLatest: "1.2.2",
+          outputPath: join(root, "latest-replay.json"),
+        }),
+      /latest does not select the signed promoted version/,
+    );
+    assert.throws(
+      () =>
+        verifyCompletedPromotion({
+          ...base,
+          currentNext: "1.2.4",
+          outputPath: join(root, "next-drift.json"),
+        }),
+      /current next differs from the signed promotion precondition/,
+    );
+    const substitutedMetadata = metadata(tarball);
+    substitutedMetadata.dist.shasum = "f".repeat(40);
+    assert.throws(
+      () =>
+        verifyCompletedPromotion({
+          ...base,
+          registryMetadata: substitutedMetadata,
+          outputPath: join(root, "digest-drift.json"),
+        }),
+      /promoted registry digest metadata differs/,
+    );
+    assert.throws(
+      () =>
+        verifyCompletedPromotion({
+          ...base,
+          releaseSha: "not-main",
+          outputPath: join(root, "release-drift.json"),
+        }),
+      /release identity differs/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

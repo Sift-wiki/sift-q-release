@@ -11,139 +11,136 @@ repository's GitHub-hosted jobs are unavailable.
 
 ## How a release happens
 
-1. Accepted private `main` automatically runs `deploy-development`. That lane
-   builds the package once, deploys the same source to `dev-q.sift.wiki`, runs
-   the clean-HOME npm canary, and uploads exactly three files: the tarball and
-   two signed receipts.
-2. A maintainer records that successful run ID and the signed candidate's
-   `sha256:...` receipt digest, creates a short-lived signed stage
-   authorization for the exact candidate, and dispatches `stage-npm-latest`
-   here with those exact inputs.
+1. Accepted private `main` runs `deploy-development`. That lane builds the
+   package once, deploys the same source to `dev.q.sift.wiki`, runs the clean-HOME
+   npm canary, and uploads exactly three files: the tarball and two signed
+   receipts.
+2. Nicholas (`Unobtainiumrock`) or Charles (`orange-juice-1024`) records that
+   successful run ID and the signed candidate's `sha256:...` receipt digest,
+   then dispatches `publish-npm` here with those exact inputs and `dry_run=true`.
 3. The no-OIDC selection job uses a fine-grained read-only token to verify the
    private repository ID, workflow path, accepted-main lineage, run result,
    artifact identity, exact file set, Ed25519 signatures, source/tree/receipt
    digests, runtime-canary receipt, tarball digest, and package metadata. It
-   does not install, build, pack, or execute candidate code. Its public
-   handoff contains only authenticated ciphertext. Before uploading that
-   ciphertext, it proves the configured RSA public key's SPKI fingerprint is
-   bound into the short-lived owner-signed stage authorization.
-4. Production proves the RSA private key derives that same signed SPKI before
-   decrypting and validating the candidate, then repeats the proof before publishing another
-   ciphertext-only command artifact. The OIDC job decrypts it in ephemeral
-   storage only after independently deriving the private key's public SPKI and
-   comparing it with the verified signed fingerprint; the command contains the verified tarball, signed authority,
-   verifier and its complete module closure, and exact-byte manifest. It
-   rechecks current `main`, authorization lifetime, replay state, registry
-   absence, and every command byte, then runs exactly one mutation:
-   `npm stage publish npm-package.tgz --tag latest --ignore-scripts --access public --json`.
-   It has no private-repository credential or checkout and cannot approve the
-   stage.
-5. The workflow records the npm stage ID and exact package digests in a
-   nonsecret receipt. Nicholas or Charles reviews the staged package and
-   approves it interactively in npmjs.com or with `npm stage approve <stage-id>`;
-   npm requires their 2FA for that action.
-6. After approval, an owner supplies a separate short-lived signed approval
-   attestation and dispatches `verify-npm-stage-approval`. That read-only
-   workflow fetches the exact stage receipt, public metadata, and canonical
-   registry tarball; proves `latest` and every published byte match; and emits
-   a separate approval result receipt. See
-   [`docs/npm-staged-release.md`](docs/npm-staged-release.md).
-7. Rollback is roll-forward: npm versions are immutable. Before approval, a bad
-   stage is rejected or allowed to expire; after approval, it is followed by a
-   fixed patch.
+   does not install, build, pack, or execute candidate code.
+4. One of those two production owners dispatches again with the same run ID and
+   receipt digest and `dry_run=false`. The OIDC job receives only the verified
+   tarball, rechecks its digest and registry absence, and publishes those exact
+   bytes under the `next` dist-tag. It has no private-repository credential or
+   private checkout.
+5. A separate no-OIDC, no-secret, no-write job fetches that exact version back
+   through the canonical npm registry, proves the registry tarball is
+   byte-identical to the selected candidate, installs those registry-served
+   bytes under a fresh temporary HOME, runs the bounded CLI canary, re-reads
+   `next` and `latest`, proves neither moved unexpectedly, and emits
+   `npm-next-transition.json` plus `npm-latest-promotion-binding.json`.
+6. Nicholas or Charles verifies the transition and a fresh owner-signed
+   promotion authorization, reviews the canary evidence, and interactively runs
+   `npm dist-tag add @sift-wiki/q@<version> latest` with npm 2FA. This changes
+   only the tag; it never rebuilds or republishes the package bytes.
+7. That same owner dispatches `verify-npm-latest-promotion` with the original
+   transition run ID, exact evidence digest, and signed authorization. The
+   workflow has no OIDC or registry-write credential. A different production
+   owner must approve the environment. It proves the signed binding, exact
+   release-main SHA, replay state, `next` and `latest`, canonical registry
+   metadata, and public tarball bytes, then emits a durable verification receipt.
+8. Rollback is roll-forward: npm versions are immutable. Before promotion, a
+   bad candidate can be abandoned on `next`; after promotion, it is followed by
+   a fixed patch.
 
-The package ships **without a provenance attestation**. npm would generate
-one automatically for an OIDC publish from this public repository, but it
-would name a commit of this repository as the build source, and this
-repository contains no source. Rather than publish a misleading attestation,
-the workflow sets `NPM_CONFIG_PROVENANCE=false`; the private source commit
-that was published is recorded in each run's step summary.
-The tarball's `repository` metadata names this public relay, as required by the
-npm trusted-publishing relationship. That is distinct from source identity,
-which remains pinned to `Sift-wiki/sift-q-refactor` by the private run, signed
-candidate receipts, exact commit tree, and trust policy.
+The package ships **without a provenance attestation**. npm would generate one
+automatically for an OIDC publish from this public repository, but it would name
+a commit of this repository as the build source, and this repository contains no
+source. Rather than publish a misleading attestation, the workflow sets
+`NPM_CONFIG_PROVENANCE=false`. The private source commit remains bound by the
+private run, signed candidate receipts, exact commit tree, and trust policy.
+
+No release step requires production to serve the package's source SHA. Runtime
+qualification happens in development; production application deployment and npm
+tag promotion remain separate authorities over the same immutable candidate.
 
 ## Issues
 
-Bug reports and questions about `@sift-wiki/q` go in this repository's
-issue tracker.
+Bug reports and questions about `@sift-wiki/q` go in this repository's issue
+tracker.
 
 ## Repository posture
 
-This repository is the trust root of the npm lane, so it must be locked down harder than
-the workflow it holds:
+This repository is the trust root of the npm lane:
 
-- `main` accepts changes only through a pull request with one approval from a code owner
-  who is not the author; no bypass actors.
-- Activation is currently fail-closed: the `candidate-selection` environment does not yet
-  exist, while `production` still contains `SIFT_Q_READ_TOKEN` and the private source
-  repository's legacy `.github/workflows/publish-npm.yml` is still active. Activation must
-  happen in this order: (1) disable that private workflow and verify its GitHub state is
-  `disabled_manually`; (2) create `candidate-selection`, require a reviewer, forbid
-  self-review and admin bypass, allow only `main`, and add only
-  `CANDIDATE_SELECTION_LANE=exact-development-candidate`, `SIFT_Q_READ_TOKEN`, and
-  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`, the public owner trust policy, plus
-  the public transfer key whose DER-SPKI SHA-256 is bound into each signed stage
-  authorization; (3) remove `SIFT_Q_READ_TOKEN` from
-  `production`; and (4) run the first reviewed dry run. `production` must retain its
-  reviewer and main-only protections and only
-  `NPM_STAGING_LANE=oidc-stage-latest-v1`,
-  `NPM_APPROVAL_VERIFICATION_LANE=signed-stage-approval-v1`, the owner trust policy,
-  and the stage-transfer keypair;
-  the npm OIDC job must not receive either private-source secret. Every selection rechecks the exact private repository and legacy
-  workflow IDs, name, path, and `disabled_manually` state before it reads candidate bytes.
-- `tests/publish-npm-workflow.test.mjs` pins the workflow boundary: dispatch-only exact
-  identifiers, `id-token` only on the publisher, no source credential in that job,
-  SHA-pinned actions, exact npm, exact tarball transfer, historical publish-to-`next`, canonical
-  registry byte equality, no direct `latest` mutation, provenance off, and kill switch
-  first. `tests/verify-exact-candidate.test.mjs` adversarially substitutes repository,
-  workflow, event, branch, conclusion, lineage, artifact authority, file set, and file type.
-  `tests/verify-registry-transition.test.mjs` exercises the clean registry-byte canary and
-  rejects changed tarballs, noncanonical registry URLs, changed `latest`, and widened
-  evidence or promotion-binding schemas.
-  Relay CI runs both suites on every pull request.
-- Each authority has its own kill switch. `candidate-selection` requires
-  `CANDIDATE_SELECTION_LANE=exact-development-candidate`; `production` requires
-  `NPM_STAGING_LANE=oidc-stage-latest-v1` and
-  `NPM_APPROVAL_VERIFICATION_LANE=signed-stage-approval-v1`. Environment admins can stop
-  either boundary without a workflow edit.
+- `main` accepts changes only through a pull request with one approval from a
+  code owner who is not the author; there are no bypass actors. Tianjun
+  (`goodnight000`) may review code, but production and npm runtime authority is
+  restricted to Nicholas and Charles.
+- Every mutation workflow is dispatch-only, main-only, and gates both the
+  original dispatcher and any rerun initiator to `Unobtainiumrock` or
+  `orange-juice-1024`. The production environment must
+  contain only those two required reviewers, require approval by someone other
+  than the dispatcher, disable administrator bypass, and allow only `main`.
+- Activation remains fail-closed until the private legacy publisher is
+  `disabled_manually`, `candidate-selection` exists, private-source credentials
+  are removed from `production`, the public exact-candidate lane is dry-run
+  qualified, and the production environment is reconciled to the two owners.
+- `candidate-selection` contains only
+  `CANDIDATE_SELECTION_LANE=exact-development-candidate`, the fine-grained
+  read-only `SIFT_Q_READ_TOKEN`, and
+  `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`. `production` contains only
+  `NPM_PUBLISHER_LANE=github-actions-oidc` and the public
+  `NPM_LATEST_PROMOTION_VERIFIER_LANE=signed-next-to-latest-v1` plus
+  `NPM_LATEST_PROMOTION_TRUST_POLICY_JSON`. No npm token, private source token,
+  or private signing key belongs in `production`.
+- The single npm trusted publisher is restricted to this public repository,
+  `.github/workflows/publish-npm.yml`, the `production` environment, and
+  `npm publish`. OIDC is never used for `npm dist-tag`; the final tag mutation is
+  an interactive Nicholas/Charles action protected by npm 2FA.
+- Each authority has an independent kill switch. Until every activation item is
+  proven, leave the relevant switch unset so the workflow fails before reading
+  candidate bytes or requesting npm write authority.
 
-## Staged latest interface
+## Latest promotion interface
 
-Trusted publishing does not authenticate `npm dist-tag add`; OIDC supports
-`npm publish` and `npm stage publish`. npm also shares one immutable version
-index between staged and published packages, so a version already published to
-`next` cannot later be staged. Future releases therefore stage the exact
-development-qualified candidate directly with the intended immutable tag
-`latest` and never publish that version to `next` first.
+`publish-npm` never invokes `npm dist-tag` and never publishes with
+`--tag latest`. Its evidence artifact contains:
 
-The existing `publish-npm` implementation and its transition evidence remain
-available as reviewed historical work, but its live mutation path must stay
-disabled. It is not the activation path for future versions. Versions already
-published to `next` are outside this automated lane and require an explicit,
-separately reviewed owner decision.
+- `npm-next-transition.json`: exact source, candidate receipt, tarball digest,
+  canonical registry metadata, unchanged `latest`, and clean canary result.
+- `npm-latest-promotion-binding.json`: the exact payload a signed promotion
+  authorization must bind, including the transition-evidence digest,
+  source/tree SHAs, candidate receipt digest, tarball digest, version, and the
+  expected `next` and pre-promotion `latest` values.
 
-No production signing key or npm credential is stored here. The only npm
-mutation uses GitHub OIDC; stage approval is an interactive npm 2FA act by
-Nicholas or Charles. Both operations are bound together afterward by a signed
-approval attestation and an independently generated registry-verification
-receipt.
+`scripts/verify-registry-transition.mjs verify-promotion-receipt` validates the
+authorization before the owner runs the 2FA command. After the tag moves,
+`verify-npm-latest-promotion` consumes the same authorization and transition
+evidence, proves the exact public bytes and tag state, rejects a reused
+authorization ID, and records both the signed authorization and a strict
+read-only verification result.
+
+The final mutation is intentionally human and exact:
+
+```sh
+npm dist-tag add "@sift-wiki/q@<version>" latest
+```
+
+Only Nicholas or Charles may run it. npm prompts for 2FA. The command moves a
+label to the already published and canaried version; it cannot alter that
+version's immutable tarball.
 
 ## Break glass
 
-The two-person rule (required reviewer ≠ dispatcher) has exactly two production
-owners — Unobtainiumrock and goodnight000. If the other owner is unreachable
-and a release cannot wait, an admin lifts the rule for one window:
+The two-person rule has exactly two production owners: Nicholas
+(`Unobtainiumrock`) and Charles (`orange-juice-1024`). If the other owner is
+unreachable and a release cannot wait, an admin may lift only the reviewer rule
+for one recorded window:
 
-```
-ops/break-glass.sh status                      # what is the rule right now
-ops/break-glass.sh open "hotfix 0.9.x, <who> unreachable"   # lifts the reviewer rule; reason is recorded
-#   ...dispatch and publish...
-ops/break-glass.sh close                       # restores both owners, no self-review, no admin bypass
+```text
+ops/break-glass.sh status
+ops/break-glass.sh open "hotfix reason; other owner unreachable"
+# dispatch or verify the exact release
+ops/break-glass.sh close
 ```
 
-While the glass is open, every other control still applies: `main`-only branch policy, the kill
-switch, the guard, OIDC, and the SHA-pinned workflow behind reviewed pull requests. Only the second
-human is removed. Both mutations are in GitHub's audit log under the caller's account and in
-`~/.local/state/sift-q-release/break-glass.log`; `open` and `close` each verify the live state and
-fail loudly rather than report a request as success. `close` is idempotent — run it whenever in doubt.
+The workflows' hard actor gates remain in force while the glass is open, so the
+window never grants Tianjun or another collaborator production/npm runtime
+authority. `close` always restores Nicholas and Charles, no self-review, no
+administrator bypass, and the main-only branch policy.

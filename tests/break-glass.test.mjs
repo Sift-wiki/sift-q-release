@@ -29,11 +29,14 @@ test("open verifies the rule is gone and fails loudly if not", () => {
 });
 
 test("the canonical reviewer list and README contain only the two production owners", () => {
-  assert.match(sh, /REVIEWERS=\(Unobtainiumrock goodnight000\)/);
-  assert.doesNotMatch(sh, /orange-juice-1024|siftwiki/);
+  assert.match(sh, /REVIEWERS=\(Unobtainiumrock orange-juice-1024\)/);
+  assert.doesNotMatch(sh, /goodnight000|siftwiki/);
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  assert.match(readme, /Unobtainiumrock and goodnight000/);
-  assert.doesNotMatch(readme, /orange-juice-1024|siftwiki/);
+  assert.match(readme, /Unobtainiumrock.*orange-juice-1024/s);
+  assert.match(
+    readme,
+    /Tianjun\n\s+\(`goodnight000`\) may review code, but production and npm runtime authority is\n\s+restricted to Nicholas and Charles/,
+  );
 });
 
 test("open snapshots live reviewers for evidence but close restores only the canonical owners", () => {
