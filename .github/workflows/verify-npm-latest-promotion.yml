@@ -149,6 +149,7 @@ jobs:
           NEXT=$(npm view "$PACKAGE" dist-tags.next) || { echo "refusing: cannot read next"; exit 1; }
           LATEST=$(npm view "$PACKAGE" dist-tags.latest) || { echo "refusing: cannot read latest"; exit 1; }
           MAINTAINERS=$(npm view "$PACKAGE" maintainers --json) || { echo "refusing: cannot read npm maintainer authority"; exit 1; }
+          printf '%s\n' "$MAINTAINERS" >"$BOUNDARY/npm-maintainers.json"
           node scripts/npm-provider-state.mjs maintainers --maintainers-json "$MAINTAINERS"
           npm view "$PACKAGE@$VERSION" --json >"$BOUNDARY/registry-metadata.json" || {
             echo "refusing: promoted version is not public"
@@ -193,6 +194,86 @@ jobs:
             "$RUNNER_TEMP/latest-verification/npm-next-transition.json"
           cp "$BOUNDARY/transition/npm-latest-promotion-binding.json" \
             "$RUNNER_TEMP/latest-verification/npm-latest-promotion-binding.json"
+          cp "$BOUNDARY/trust-policy.json" \
+            "$RUNNER_TEMP/latest-verification/npm-latest-promotion-trust-policy.json"
+          cp "$BOUNDARY/run.json" \
+            "$RUNNER_TEMP/latest-verification/transition-run-metadata.json"
+          cp "$BOUNDARY/artifacts.json" \
+            "$RUNNER_TEMP/latest-verification/transition-artifacts-metadata.json"
+          cp "$BOUNDARY/selection.json" \
+            "$RUNNER_TEMP/latest-verification/transition-artifact-selection.json"
+          cp "$BOUNDARY/registry-metadata.json" \
+            "$RUNNER_TEMP/latest-verification/npm-registry-metadata.json"
+          cp "$BOUNDARY/registry-package.tgz" \
+            "$RUNNER_TEMP/latest-verification/npm-registry-package.tgz"
+          cp "$BOUNDARY/npm-maintainers.json" \
+            "$RUNNER_TEMP/latest-verification/npm-maintainers.json"
+          node --input-type=module - \
+            "$RUNNER_TEMP/latest-verification/npm-latest-verification-provenance.json" \
+            "$BOUNDARY/trust-policy.json" "$BOUNDARY/run.json" \
+            "$BOUNDARY/artifacts.json" "$BOUNDARY/selection.json" \
+            "$LATEST" "$NEXT" <<'NODE'
+          import { createHash, createPublicKey } from "node:crypto";
+          import { readFileSync, writeFileSync } from "node:fs";
+          const [output, trustFile, runFile, artifactsFile, selectionFile, latest, next] = process.argv.slice(2);
+          const bytes = (file) => readFileSync(file);
+          const sha256 = (value) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+          const trustPolicy = JSON.parse(bytes(trustFile));
+          const run = JSON.parse(bytes(runFile));
+          const artifacts = JSON.parse(bytes(artifactsFile));
+          const selection = JSON.parse(bytes(selectionFile));
+          const provenance = {
+            schemaVersion: "sift-q-npm-latest-verification-provenance/v1",
+            releaseRepository: process.env.GITHUB_REPOSITORY,
+            releaseSha: process.env.GITHUB_SHA,
+            verificationRunId: process.env.GITHUB_RUN_ID,
+            verificationRunAttempt: process.env.GITHUB_RUN_ATTEMPT,
+            verificationWorkflowRef: process.env.GITHUB_WORKFLOW_REF,
+            actor: process.env.GITHUB_ACTOR,
+            triggeringActor: process.env.GITHUB_TRIGGERING_ACTOR,
+            observedLatest: latest,
+            observedNext: next,
+            transition: {
+              runId: String(run.id),
+              workflowName: run.name,
+              workflowPath: run.path,
+              headSha: run.head_sha,
+              artifactId: selection.artifactId,
+              artifactName: selection.artifactName,
+              runMetadataDigest: sha256(bytes(runFile)),
+              artifactsMetadataDigest: sha256(bytes(artifactsFile)),
+              selectionDigest: sha256(bytes(selectionFile)),
+              artifactCount: artifacts.total_count,
+            },
+            trustPolicyDigest: sha256(bytes(trustFile)),
+            trustKeys: trustPolicy.keys.map((key) => ({
+              algorithm: key.algorithm,
+              keyId: key.keyId,
+              publicKeySpkiDigest: sha256(
+                createPublicKey(key.publicKeyPem).export({ format: "der", type: "spki" }),
+              ),
+            })),
+          };
+          writeFileSync(output, `${JSON.stringify(provenance)}\n`, { flag: "wx", mode: 0o600 });
+          NODE
+          EXPECTED=$(printf '%s\n' \
+            npm-latest-promotion-binding.json \
+            npm-latest-promotion-trust-policy.json \
+            npm-latest-verification-provenance.json \
+            npm-latest-verification.json \
+            npm-maintainers.json \
+            npm-next-transition.json \
+            npm-registry-metadata.json \
+            npm-registry-package.tgz \
+            signed-npm-latest-promotion.json \
+            transition-artifact-selection.json \
+            transition-artifacts-metadata.json \
+            transition-run-metadata.json | sort)
+          ACTUAL=$(find "$RUNNER_TEMP/latest-verification" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          test "$ACTUAL" = "$EXPECTED" || {
+            echo "refusing: final verification artifact file set differs"
+            exit 1
+          }
           echo "artifact_name=$ARTIFACT_NAME" >>"$GITHUB_OUTPUT"
           echo "authorization_id=$AUTHORIZATION_ID" >>"$GITHUB_OUTPUT"
           echo "receipt_digest=$RECEIPT_DIGEST" >>"$GITHUB_OUTPUT"

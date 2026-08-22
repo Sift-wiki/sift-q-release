@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { closeSync, openSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   PACKAGE_NAME,
@@ -11,6 +20,8 @@ import {
 
 const STABLE_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 const ALLOWED_ACTORS = new Set(["jxiao1024", "unobtainiumrock"]);
+const CANONICAL_REGISTRY = "https://registry.npmjs.org/";
+const PINNED_NPM_VERSION = "11.19.0";
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -85,10 +96,16 @@ export function verifyRejectedNextReset({ plan, maintainers, distTags }) {
   return { ...plan, nextAfter: distTags.next };
 }
 
-function npmJson(args, label) {
-  const result = spawnSync("npm", args, {
+function npmRun(runtime, args, options = {}) {
+  return spawnSync(process.execPath, [runtime.cliPath, ...args], {
+    ...options,
+    env: runtime.env,
+  });
+}
+
+function npmJson(runtime, args, label) {
+  const result = npmRun(runtime, args, {
     encoding: "utf8",
-    env: { ...process.env, NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/" },
   });
   invariant(result.status === 0, `cannot read ${label} from npm`);
   try {
@@ -98,26 +115,28 @@ function npmJson(args, label) {
   }
 }
 
-function npmText(args, label) {
-  const result = spawnSync("npm", args, {
+function npmText(runtime, args, label) {
+  const result = npmRun(runtime, args, {
     encoding: "utf8",
-    env: { ...process.env, NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/" },
   });
   invariant(result.status === 0, `cannot read ${label} from npm`);
   return result.stdout.trim();
 }
 
-function providerInputs() {
+function providerInputs(runtime) {
   return {
     maintainers: npmJson(
+      runtime,
       ["view", PACKAGE_NAME, "maintainers", "--json"],
       "npm maintainers",
     ),
     distTags: npmJson(
+      runtime,
       ["view", PACKAGE_NAME, "dist-tags", "--json"],
       "npm dist-tags",
     ),
     versions: npmJson(
+      runtime,
       ["view", PACKAGE_NAME, "versions", "--json"],
       "npm versions",
     ),
@@ -145,20 +164,84 @@ function required(values, key) {
   return value;
 }
 
-function writeReceipt(path, value) {
-  const fd = openSync(resolve(path), "wx", 0o600);
-  try {
-    writeFileSync(fd, `${canonicalJson(value)}\n`, "utf8");
-  } finally {
-    closeSync(fd);
-  }
+function regularProtectedPath(value, label) {
+  invariant(isAbsolute(value), `${label} path is not absolute`);
+  invariant(
+    !lstatSync(value).isSymbolicLink(),
+    `${label} must not be a symlink`,
+  );
+  const path = realpathSync(value);
+  const stat = lstatSync(path);
+  invariant(stat.isFile() && !stat.isSymbolicLink(), `${label} is not a file`);
+  return { path, stat };
+}
+
+function npmRuntimeOf(values) {
+  const cli = regularProtectedPath(required(values, "--npm-cli-js"), "npm CLI");
+  const userconfig = regularProtectedPath(
+    required(values, "--npm-userconfig"),
+    "npm userconfig",
+  );
+  invariant(
+    (userconfig.stat.mode & 0o077) === 0,
+    "npm userconfig must not be group/world accessible",
+  );
+  invariant(
+    (cli.stat.mode & 0o022) === 0,
+    "npm CLI must not be group/world writable",
+  );
+  const runtime = {
+    cliPath: cli.path,
+    cliDigest: `sha256:${createHash("sha256").update(readFileSync(cli.path)).digest("hex")}`,
+    userconfigPath: userconfig.path,
+    env: {
+      NPM_CONFIG_USERCONFIG: userconfig.path,
+      NPM_CONFIG_GLOBALCONFIG: "/dev/null",
+      NPM_CONFIG_REGISTRY: CANONICAL_REGISTRY,
+      "npm_config_@sift-wiki:registry": CANONICAL_REGISTRY,
+      NPM_CONFIG_AUDIT: "false",
+      NPM_CONFIG_FUND: "false",
+      NPM_CONFIG_IGNORE_SCRIPTS: "true",
+    },
+  };
+  invariant(
+    npmText(runtime, ["--version"], "npm version") === PINNED_NPM_VERSION,
+    `npm version is not pinned ${PINNED_NPM_VERSION}`,
+  );
+  invariant(
+    npmText(runtime, ["config", "get", "registry"], "npm registry") ===
+      CANONICAL_REGISTRY,
+    "effective npm registry is not canonical",
+  );
+  invariant(
+    npmText(
+      runtime,
+      ["config", "get", "@sift-wiki:registry"],
+      "scoped npm registry",
+    ) === CANONICAL_REGISTRY,
+    "effective @sift-wiki registry is not canonical",
+  );
+  return runtime;
+}
+
+function reserveReceipt(path) {
+  const resolved = resolve(path);
+  return { fd: openSync(resolved, "wx", 0o600), path: resolved };
+}
+
+function writeReceipt(reservation, value) {
+  writeFileSync(reservation.fd, `${canonicalJson(value)}\n`, "utf8");
 }
 
 function main(argv) {
   const { command, values } = argumentsOf(argv);
   const rejectedVersion = required(values, "--rejected-version");
-  const plan = planRejectedNextReset({ rejectedVersion, ...providerInputs() });
   if (command === "status") {
+    const runtime = npmRuntimeOf(values);
+    const plan = planRejectedNextReset({
+      rejectedVersion,
+      ...providerInputs(runtime),
+    });
     process.stdout.write(`${canonicalJson(plan)}\n`);
     return;
   }
@@ -175,42 +258,64 @@ function main(argv) {
     reason.length >= 20 && reason.length <= 500,
     "reset reason must be 20..500 characters",
   );
-  const actor = npmText(["whoami"], "authenticated npm actor");
-  invariant(
-    ALLOWED_ACTORS.has(actor),
-    "authenticated npm actor is not Nicholas or Charles",
-  );
-  const rechecked = planRejectedNextReset({
-    rejectedVersion,
-    ...providerInputs(),
-  });
-  invariant(
-    canonicalJson(rechecked) === canonicalJson(plan),
-    "npm provider state changed before next reconciliation",
-  );
-  const mutation = spawnSync(
-    "npm",
-    ["dist-tag", "add", `${PACKAGE_NAME}@${plan.resetNextTo}`, "next"],
-    {
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/",
+  const reservation = reserveReceipt(required(values, "--receipt-output"));
+  let mutationApplied = false;
+  let receiptWritten = false;
+  try {
+    const runtime = npmRuntimeOf(values);
+    const plan = planRejectedNextReset({
+      rejectedVersion,
+      ...providerInputs(runtime),
+    });
+    const actor = npmText(runtime, ["whoami"], "authenticated npm actor");
+    invariant(
+      ALLOWED_ACTORS.has(actor),
+      "authenticated npm actor is not Nicholas or Charles",
+    );
+    const rechecked = planRejectedNextReset({
+      rejectedVersion,
+      ...providerInputs(runtime),
+    });
+    invariant(
+      canonicalJson(rechecked) === canonicalJson(plan),
+      "npm provider state changed before next reconciliation",
+    );
+    const mutation = npmRun(
+      runtime,
+      ["dist-tag", "add", `${PACKAGE_NAME}@${plan.resetNextTo}`, "next"],
+      {
+        stdio: "inherit",
       },
-    },
-  );
-  invariant(mutation.status === 0, "npm next reconciliation failed");
-  const verified = verifyRejectedNextReset({ plan, ...providerInputs() });
-  const receipt = {
-    schemaVersion: "sift-q-npm-rejected-next-reconciliation/v1",
-    authority: "interactive-npm-owner-2fa",
-    actor,
-    reason,
-    observedAt: new Date().toISOString(),
-    ...verified,
-  };
-  writeReceipt(required(values, "--receipt-output"), receipt);
-  process.stdout.write(`${canonicalJson(receipt)}\n`);
+    );
+    invariant(mutation.status === 0, "npm next reconciliation failed");
+    mutationApplied = true;
+    const verified = verifyRejectedNextReset({
+      plan,
+      ...providerInputs(runtime),
+    });
+    const receipt = {
+      schemaVersion: "sift-q-npm-rejected-next-reconciliation/v1",
+      authority: "interactive-npm-owner-2fa",
+      actor,
+      reason,
+      observedAt: new Date().toISOString(),
+      npmClient: {
+        cliPath: runtime.cliPath,
+        cliDigest: runtime.cliDigest,
+        nodePath: process.execPath,
+        nodeVersion: process.version,
+        version: PINNED_NPM_VERSION,
+      },
+      registry: CANONICAL_REGISTRY,
+      ...verified,
+    };
+    writeReceipt(reservation, receipt);
+    receiptWritten = true;
+    process.stdout.write(`${canonicalJson(receipt)}\n`);
+  } finally {
+    closeSync(reservation.fd);
+    if (!mutationApplied && !receiptWritten) unlinkSync(reservation.path);
+  }
 }
 
 const isMain =

@@ -97,6 +97,26 @@ test("signed authorization, tag state, registry bytes, and replay marker are all
     verifyJob,
     /cp "\$BOUNDARY\/transition\/npm-latest-promotion-binding\.json"[\s\S]*?latest-verification\/npm-latest-promotion-binding\.json/,
   );
+  for (const file of [
+    "npm-latest-promotion-trust-policy.json",
+    "transition-run-metadata.json",
+    "transition-artifacts-metadata.json",
+    "transition-artifact-selection.json",
+    "npm-registry-metadata.json",
+    "npm-registry-package.tgz",
+    "npm-maintainers.json",
+    "npm-latest-verification-provenance.json",
+  ]) {
+    assert.match(verifyJob, new RegExp(file.replaceAll(".", "\\.")));
+  }
+  assert.match(verifyJob, /publicKeySpkiDigest/);
+  assert.match(verifyJob, /trustPolicyDigest/);
+  assert.match(verifyJob, /runMetadataDigest/);
+  assert.match(verifyJob, /final verification artifact file set differs/);
+  assert.match(
+    verifyJob,
+    /find "\$RUNNER_TEMP\/latest-verification"[\s\S]*?-type f[\s\S]*?sort/,
+  );
   assert.match(verifyJob, /retention-days: 90/);
 });
 

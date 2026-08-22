@@ -15,7 +15,7 @@ test("trusted-publisher setup uses npm's filename-only workflow field", () => {
 test("operator docs describe bounded retention and complete owner archival", () => {
   assert.match(
     readme,
-    /retains the signed receipt, transition evidence,[\s\S]*promotion binding[\s\S]*verification result for 90 days/,
+    /retains the signed receipt, transition evidence,[\s\S]*public trust policy[\s\S]*run and artifact[\s\S]*verification result for 90 days/,
   );
   assert.match(
     readme,
@@ -25,6 +25,16 @@ test("operator docs describe bounded retention and complete owner archival", () 
     readme,
     /copy the whole bundle into the owner-controlled release archive/,
   );
+  for (const file of [
+    "npm-latest-promotion-trust-policy.json",
+    "npm-latest-verification-provenance.json",
+    "transition-run-metadata.json",
+    "transition-artifacts-metadata.json",
+    "transition-artifact-selection.json",
+    "npm-registry-package.tgz",
+  ]) {
+    assert.match(readme, new RegExp(file.replaceAll(".", "\\.")));
+  }
 });
 
 test("operator docs disclose the provider no-CAS residual and the short final window", () => {

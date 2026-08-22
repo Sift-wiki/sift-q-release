@@ -148,14 +148,31 @@ The archived owner-signed Ed25519 authorization covers the exact transition
 evidence digest and promotion preconditions; its canonical SHA-256 digest is
 embedded in the result. The result's own digest is recorded in the GitHub run
 summary. The uploaded bundle retains the signed receipt, transition evidence,
-promotion binding, and verification result for 90 days, but GitHub artifacts
-are deletable and expiring; they are not an immutable archive. The owner must
-copy the whole bundle into the owner-controlled release archive before that
-window expires. External verification checks the owner signature and both
-canonical digests, then relies on captured GitHub run metadata. This avoids placing a
-long-lived owner signing secret in GitHub. The owner signature does not cover
-the post-state result, and that result must not be described as independently
-signed.
+promotion binding, public trust policy, raw bounded transition run and artifact
+provenance, selected-artifact metadata, registry metadata and bytes, maintainer
+snapshot, verification provenance with public-key/digest bindings, and
+verification result for 90 days. The promotion trust policy is public-only: it
+must contain Ed25519 public keys and identifiers, never private key material.
+GitHub artifacts are deletable and expiring; they are not an immutable archive.
+The owner must copy the whole bundle into the owner-controlled release archive
+before that window expires. External verification checks the archived public
+key against its SPKI digest, verifies the owner signature and canonical
+digests, and compares the bounded run/artifact metadata to the verification
+provenance. This avoids placing a long-lived owner signing secret in GitHub.
+The owner signature does not cover the post-state result, and that result must
+not be described as independently signed.
+
+The exact bounded archive file set is:
+
+- `signed-npm-latest-promotion.json`, `npm-next-transition.json`, and
+  `npm-latest-promotion-binding.json`;
+- `npm-latest-promotion-trust-policy.json`,
+  `npm-latest-verification-provenance.json`, and
+  `npm-latest-verification.json`;
+- `transition-run-metadata.json`, `transition-artifacts-metadata.json`, and
+  `transition-artifact-selection.json`;
+- `npm-registry-metadata.json`, `npm-registry-package.tgz`, and
+  `npm-maintainers.json`.
 
 The final mutation is intentionally human and exact:
 
@@ -183,12 +200,25 @@ runs the read-only status command, records the reason, then performs the explici
 mode-0600 reconciliation receipt:
 
 ```sh
-node scripts/reconcile-rejected-next.mjs status --rejected-version <version>
+node scripts/reconcile-rejected-next.mjs status --rejected-version <version> \
+  --npm-cli-js /absolute/path/to/npm-cli.js \
+  --npm-userconfig /secure/owner-only.npmrc
 node scripts/reconcile-rejected-next.mjs reset --rejected-version <version> \
+  --npm-cli-js /absolute/path/to/npm-cli.js \
+  --npm-userconfig /secure/owner-only.npmrc \
   --confirm RESET-REJECTED-NEXT-TO-LATEST \
   --reason '<at least 20 characters describing the rejected canary>' \
   --receipt-output rejected-next-reconciliation.json
 ```
+
+Both commands require the same absolute npm CLI and mode-0600 owner-only npm
+userconfig arguments. The helper runs the CLI through the current absolute Node
+binary, refuses symlinked or group/world-writable CLI material, records its
+SHA-256 digest, requires npm 11.19.0, scrubs ambient npm configuration, and verifies the
+effective unscoped and `@sift-wiki` registries are exactly
+`https://registry.npmjs.org/`. The reset reserves its exclusive receipt output
+before the first npm provider call, so a missing, existing, or unavailable
+receipt path cannot mutate `next`.
 
 ## Break glass
 
