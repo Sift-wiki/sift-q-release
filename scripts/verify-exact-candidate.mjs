@@ -12,6 +12,12 @@ import { validateSignedNpmRuntimeCanary } from "./vendor/ol/npm-publisher-contra
 
 export const SOURCE_REPOSITORY = "Sift-wiki/sift-q-refactor";
 export const SOURCE_REPOSITORY_ID = 1_329_084_838;
+// This is the private company-AWS development-candidate producer. A workflow
+// path alone is not enough: a different workflow can be given the same path
+// after a source-repository change. Rebinding this identity is an owner review
+// decision and must be made deliberately with the source-lane evidence.
+export const SOURCE_WORKFLOW_ID = 339_350_411;
+export const SOURCE_WORKFLOW_NAME = "deploy-development-exact-candidate";
 export const SOURCE_WORKFLOW_PATH = ".github/workflows/deploy-development.yml";
 export const LEGACY_PUBLISH_WORKFLOW_ID = 339_277_809;
 export const LEGACY_PUBLISH_WORKFLOW_NAME = "publish-qualified-npm-candidate";
@@ -189,6 +195,14 @@ export function validateRunSelection({
   invariant(
     run.repository.full_name === SOURCE_REPOSITORY,
     "candidate run repository differs",
+  );
+  invariant(
+    run.workflow_id === SOURCE_WORKFLOW_ID,
+    "candidate run workflow id differs",
+  );
+  invariant(
+    run.name === SOURCE_WORKFLOW_NAME,
+    "candidate run workflow name differs",
   );
   invariant(
     run.path === SOURCE_WORKFLOW_PATH,

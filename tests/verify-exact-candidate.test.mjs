@@ -37,6 +37,8 @@ import {
   PACKAGE_REPOSITORY,
   SOURCE_REPOSITORY,
   SOURCE_REPOSITORY_ID,
+  SOURCE_WORKFLOW_ID,
+  SOURCE_WORKFLOW_NAME,
   SOURCE_WORKFLOW_PATH,
   validateCandidateFiles,
   validateLegacyPublisherDisabled,
@@ -133,6 +135,8 @@ function validBoundary() {
     run: {
       id: runId,
       repository: { id: SOURCE_REPOSITORY_ID, full_name: SOURCE_REPOSITORY },
+      workflow_id: SOURCE_WORKFLOW_ID,
+      name: SOURCE_WORKFLOW_NAME,
       path: SOURCE_WORKFLOW_PATH,
       event: "workflow_run",
       head_branch: "main",
@@ -179,6 +183,16 @@ test("selects one successful automatic main candidate from the canonical private
 
 for (const [label, mutate, expected] of [
   ["repository id", (v) => (v.run.repository.id += 1), /repository id differs/],
+  [
+    "workflow id",
+    (v) => (v.run.workflow_id += 1),
+    /workflow id differs/,
+  ],
+  [
+    "workflow name",
+    (v) => (v.run.name = "other-development-candidate"),
+    /workflow name differs/,
+  ],
   [
     "workflow path",
     (v) => (v.run.path = ".github/workflows/ci.yml"),

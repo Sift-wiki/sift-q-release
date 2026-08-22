@@ -53,3 +53,33 @@ test("operator docs provide offline signing and rejected-next reconciliation com
   assert.match(readme, /reconcile-rejected-next\.mjs status/);
   assert.match(readme, /RESET-REJECTED-NEXT-TO-LATEST/);
 });
+
+test("activation handover records the live blockers and owner-only recovery order", () => {
+  assert.match(readme, /Activation preconditions and owner-only sequence/);
+  assert.match(
+    readme,
+    /Nicholas: GitHub `Unobtainiumrock`; npm `unobtainiumrock`/,
+  );
+  assert.match(
+    readme,
+    /Charles: GitHub `orange-juice-1024`; npm `jxiao1024`/,
+  );
+  assert.match(
+    readme,
+    /unobtainiumrock_three`, `goodnight00`,\s+`unobtainiumrock`, and `jxiao1024`/,
+  );
+  assert.match(readme, /no `candidate-selection` environment/);
+  assert.match(readme, /`production` contained `SIFT_Q_READ_TOKEN`/);
+  assert.match(
+    readme,
+    /no successful `deploy-development-exact-candidate` run among the\s+most recent 100 workflow runs/,
+  );
+  assert.match(
+    readme,
+    /workflow ID\s+`339350411`/,
+  );
+  assert.match(readme, /must reconcile the live maintainer\s+set to exactly `unobtainiumrock` and `jxiao1024`/);
+  assert.match(readme, /must remove `SIFT_Q_READ_TOKEN` from `production`/);
+  assert.match(readme, /A skipped run, a personal-account candidate, or a candidate\s+from another workflow cannot substitute/);
+  assert.match(readme, /It does not run `npm owner`/);
+});

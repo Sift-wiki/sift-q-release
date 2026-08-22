@@ -11,10 +11,15 @@ repository's GitHub-hosted jobs are unavailable.
 
 ## How a release happens
 
-1. Accepted private `main` runs `deploy-development`. That lane builds the
-   package once, deploys the same source to `dev.q.sift.wiki`, runs the clean-HOME
-   npm canary, and uploads exactly three files: the tarball and two signed
-   receipts.
+1. Accepted private `main` runs the fixed company-AWS development producer:
+   `deploy-development-exact-candidate` (workflow ID `339350411`, path
+   `.github/workflows/deploy-development.yml`). That lane builds the package
+   once, deploys the same source to `dev.q.sift.wiki`, runs the clean-HOME npm
+   canary, and uploads exactly three files: the tarball and two signed
+   receipts. The public relay checks the private repository, workflow ID, name,
+   path, accepted-main lineage, and signatures. A different development run,
+   a manually dispatched run, or a run not produced by the company-AWS
+   development lane is not a candidate.
 2. Nicholas (`Unobtainiumrock`) or Charles (`orange-juice-1024`) records that
    successful run ID and the signed candidate's `sha256:...` receipt digest,
    then dispatches `publish-npm` here with those exact inputs and `dry_run=true`.
@@ -100,6 +105,76 @@ This repository is the trust root of the npm lane:
 - Each authority has an independent kill switch. Until every activation item is
   proven, leave the relevant switch unset so the workflow fails before reading
   candidate bytes or requesting npm write authority.
+
+## Activation preconditions and owner-only sequence
+
+This release repository cannot repair provider configuration. Its checks are
+deliberately fail-closed, so an absent environment, a misplaced secret, an
+extra npm maintainer, or no qualified candidate stops before an npm write. Do
+not dispatch `publish-npm`, enable a workflow, publish, move a tag, alter npm
+owners, or change an environment while any item below is open.
+
+The required npm maintainer set is exactly these two production authorities:
+
+- Nicholas: GitHub `Unobtainiumrock`; npm `unobtainiumrock`.
+- Charles: GitHub `orange-juice-1024`; npm `jxiao1024`.
+
+The checked-in provider verifier accepts only `unobtainiumrock` and `jxiao1024`.
+It rejects additions, removals, aliases, and a changed set before dry-run,
+immediately before publication, immediately after publication, and after the
+registry canary. It does not run `npm owner` and cannot reconcile the provider
+for an owner.
+
+### Read-only reconciliation snapshot — 2026-08-22
+
+This snapshot is evidence for the activation handover, not a replacement for a
+fresh owner check immediately before activation:
+
+- npm reported four maintainers: `unobtainiumrock_three`, `goodnight00`,
+  `unobtainiumrock`, and `jxiao1024`. This is not the exact Nicholas/Charles
+  set, so the provider verifier refuses it.
+- This repository had no `candidate-selection` environment. Therefore neither
+  its lane selector nor its two required secrets existed in that environment.
+- `production` contained `SIFT_Q_READ_TOKEN`. The private-source read token is
+  not permitted there.
+- The private `development` environment had no visible configuration names and
+  there was no successful `deploy-development-exact-candidate` run among the
+  most recent 100 workflow runs. There is no qualified company-AWS development
+  candidate to select.
+
+### Required owner actions, in order
+
+1. An authorized npm owner, using npm 2FA, must reconcile the live maintainer
+   set to exactly `unobtainiumrock` and `jxiao1024`. This is an external,
+   irreversible authority action; no repository workflow or script may do it.
+2. An authorized release-repository administrator must create the protected
+   `candidate-selection` environment, then place only these configuration
+   items there:
+   `CANDIDATE_SELECTION_LANE=exact-development-candidate`, the fine-grained
+   read-only `SIFT_Q_READ_TOKEN`, and
+   `DEVELOPMENT_CANDIDATE_TRUST_POLICY_JSON`. The read token is scoped only to
+   the private source repository with `Contents:read`, `Actions:read`, and
+   `Metadata:read`.
+3. That administrator must remove `SIFT_Q_READ_TOKEN` from `production` and
+   confirm that production has no private-source token, npm token, or private
+   signing key. Its required selectors remain
+   `NPM_PUBLISHER_LANE=github-actions-oidc`,
+   `NPM_LATEST_PROMOTION_VERIFIER_LANE=signed-next-to-latest-v1`, and
+   `NPM_LATEST_PROMOTION_TRUST_POLICY_JSON`.
+4. The company-AWS development owner must provision and attest the isolated
+   company-AWS development producer, then obtain one fresh successful automatic
+   accepted-main run of `deploy-development-exact-candidate` (workflow ID
+   `339350411`). A skipped run, a personal-account candidate, or a candidate
+   from another workflow cannot substitute for this gate.
+5. Nicholas or Charles must independently re-read the environments, secret
+   names, npm maintainers, trusted-publisher binding, disabled legacy publisher,
+   and the fresh company-AWS candidate. Only then may either owner dispatch the
+   same exact candidate in `dry_run=true`. A green dry run is evidence, not
+   permission to skip any preceding gate.
+6. After the dry run and all independent owner approvals are recorded, the
+   existing controlled sequence may proceed. The publish workflow, final npm
+   `latest` move, and any provider configuration change remain owner-only
+   actions.
 
 ## Latest promotion interface
 
